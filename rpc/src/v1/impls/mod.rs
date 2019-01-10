@@ -34,11 +34,13 @@ mod signing;
 mod signing_unsafe;
 mod traces;
 mod web3;
+mod bulk;
 
 pub mod light;
 
 pub use self::debug::DebugClient;
 pub use self::eth::{EthClient, EthClientOptions};
+pub use self::bulk::BulkClient;
 pub use self::eth_filter::EthFilterClient;
 pub use self::eth_pubsub::EthPubSubClient;
 pub use self::net::NetClient;
