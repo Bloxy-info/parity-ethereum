@@ -81,6 +81,8 @@ pub enum Api {
 	/// Geth-compatible (best-effort) debug API (Potentially UNSAFE)
 	/// NOTE We don't aim to support all methods, only the ones that are useful.
 	Debug,
+	/// Bulk API
+    Bulk
 }
 
 impl FromStr for Api {
@@ -106,6 +108,7 @@ impl FromStr for Api {
 			"shh_pubsub" => Ok(WhisperPubSub),
 			"signer" => Ok(Signer),
 			"traces" => Ok(Traces),
+			"bulk" => Ok(Bulk),
 			"web3" => Ok(Web3),
 			api => Err(format!("Unknown api: {}", api))
 		}
@@ -189,6 +192,7 @@ fn to_modules(apis: &HashSet<Api>) -> BTreeMap<String, String> {
 			Api::SecretStore => ("secretstore", "1.0"),
 			Api::Signer => ("signer", "1.0"),
 			Api::Traces => ("traces", "1.0"),
+			Api::Bulk => ("bulk", "1.0"),
 			Api::Web3 => ("web3", "1.0"),
 			Api::Whisper => ("shh", "1.0"),
 			Api::WhisperPubSub => ("shh_pubsub", "1.0"),
@@ -369,6 +373,9 @@ impl FullDependencies {
 				},
 				Api::Traces => {
 					handler.extend_with(TracesClient::new(&self.client).to_delegate())
+				},
+				Api::Bulk => {
+					handler.extend_with(BulkClient::new(&self.client, &self.miner).to_delegate())
 				},
 				Api::Rpc => {
 					let modules = to_modules(&apis);
@@ -578,6 +585,24 @@ impl<C: LightChainClient + 'static> LightDependencies<C> {
 						self.pool.clone(),
 					).to_delegate())
 				},
+				Api::Bulk => {
+					let client = light::EthClient::new(
+						self.sync.clone(),
+						self.client.clone(),
+						self.on_demand.clone(),
+						self.transaction_queue.clone(),
+						self.secret_store.clone(),
+						self.cache.clone(),
+						self.gas_price_percentile,
+						self.poll_lifetime,
+					);
+					handler.extend_with(Eth::to_delegate(client.clone()));
+
+					if !for_generic_pubsub {
+						handler.extend_with(EthFilter::to_delegate(client));
+						add_signing_methods!(EthSigning, handler, self);
+					}
+				},
 				Api::Traces => {
 					handler.extend_with(light::TracesClient.to_delegate())
 				},
@@ -642,6 +667,7 @@ impl ApiSet {
 			Api::Whisper,
 			Api::WhisperPubSub,
 			Api::Private,
+			Api::Bulk
 		].into_iter().cloned().collect();
 
 		match *self {
