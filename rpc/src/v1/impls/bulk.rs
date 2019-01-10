@@ -18,16 +18,9 @@
 
 use std::sync::Arc;
 
-use parking_lot::Mutex;
-
-use ethash::{SeedHashCompute};
-use ethcore::account_provider::AccountProvider;
 use ethcore::client::{BlockChainClient, BlockId, TransactionId, StateClient, StateInfo, Call, EngineInfo};
 use ethcore::miner::{self, MinerService};
-use ethcore::snapshot::SnapshotService;
 use ethcore::encoded;
-use sync::SyncProvider;
-use miner::external::ExternalMinerService;
 
 use jsonrpc_core::{BoxFuture, Result};
 use jsonrpc_core::futures::future;
@@ -40,58 +33,14 @@ use v1::types::{
 };
 use v1::metadata::Metadata;
 
-/// Eth RPC options
-pub struct EthClientOptions {
-	/// Return nonce from transaction queue when pending block not available.
-	pub pending_nonce_from_queue: bool,
-	/// Returns receipt from pending blocks
-	pub allow_pending_receipt_query: bool,
-	/// Send additional block number when asking for work
-	pub send_block_number_in_get_work: bool,
-	/// Gas Price Percentile used as default gas price.
-	pub gas_price_percentile: usize,
-	/// Set the timeout for the internal poll manager
-	pub poll_lifetime: u32
-}
-
-impl EthClientOptions {
-	/// Creates new default `EthClientOptions` and allows alterations
-	/// by provided function.
-	pub fn with<F: Fn(&mut Self)>(fun: F) -> Self {
-		let mut options = Self::default();
-		fun(&mut options);
-		options
-	}
-}
-
-impl Default for EthClientOptions {
-	fn default() -> Self {
-		EthClientOptions {
-			pending_nonce_from_queue: false,
-			allow_pending_receipt_query: true,
-			send_block_number_in_get_work: true,
-			poll_lifetime: 60u32,
-			gas_price_percentile: 50,
-		}
-	}
-}
 
 /// BulkClient rpc implementation.
-pub struct BulkClient<C, SN: ?Sized, S: ?Sized, M, EM> where
+pub struct BulkClient<C, M> where
 	C: miner::BlockChainClient + BlockChainClient,
-	SN: SnapshotService,
-	S: SyncProvider,
-	M: MinerService,
-	EM: ExternalMinerService {
+	M: MinerService {
 
 	client: Arc<C>,
-	snapshot: Arc<SN>,
-	sync: Arc<S>,
-	accounts: Arc<AccountProvider>,
-	miner: Arc<M>,
-	external_miner: Arc<EM>,
-	seed_compute: Mutex<SeedHashCompute>,
-	options: EthClientOptions,
+	miner: Arc<M>
 }
 
 
@@ -114,32 +63,18 @@ impl From<BlockNumber> for BlockNumberOrId {
 }
 
 
-impl<C, SN: ?Sized, S: ?Sized, M, EM, T: StateInfo + 'static> BulkClient<C, SN, S, M, EM> where
+impl<C, M, T: StateInfo + 'static> BulkClient<C, M> where
 	C: miner::BlockChainClient + BlockChainClient + StateClient<State=T> + Call<State=T> + EngineInfo,
-	SN: SnapshotService,
-	S: SyncProvider,
-	M: MinerService<State=T>,
-	EM: ExternalMinerService {
+	M: MinerService<State=T> {
 
 	/// Creates new BulkClient.
 	pub fn new(
 		client: &Arc<C>,
-		snapshot: &Arc<SN>,
-		sync: &Arc<S>,
-		accounts: &Arc<AccountProvider>,
-		miner: &Arc<M>,
-		em: &Arc<EM>,
-		options: EthClientOptions
+		miner: &Arc<M>
 	) -> Self {
 		BulkClient {
 			client: client.clone(),
-			snapshot: snapshot.clone(),
-			sync: sync.clone(),
-			miner: miner.clone(),
-			accounts: accounts.clone(),
-			external_miner: em.clone(),
-			seed_compute: Mutex::new(SeedHashCompute::default()),
-			options: options,
+			miner: miner.clone()
 		}
 	}
 
@@ -244,12 +179,9 @@ impl<C, SN: ?Sized, S: ?Sized, M, EM, T: StateInfo + 'static> BulkClient<C, SN, 
 }
 
 
-impl<C, SN: ?Sized, S: ?Sized, M, EM, T: StateInfo + 'static> Bulk for BulkClient<C, SN, S, M, EM> where
+impl<C, M, T: StateInfo + 'static> Bulk for BulkClient<C, M> where
 	C: miner::BlockChainClient + BlockChainClient + StateClient<State=T> + Call<State=T> + EngineInfo + 'static,
-	SN: SnapshotService + 'static,
-	S: SyncProvider + 'static,
 	M: MinerService<State=T> + 'static,
-	EM: ExternalMinerService + 'static,
 {
 
 	type Metadata = Metadata;
