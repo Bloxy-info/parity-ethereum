@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Parity-specific rpc implementation.
 use std::sync::Arc;
@@ -27,29 +27,27 @@ use sync::LightSyncProvider;
 use ethcore::account_provider::AccountProvider;
 use ethcore_logger::RotatingLogger;
 
-use light::client::LightChainClient;
-
 use jsonrpc_core::{Result, BoxFuture};
-use jsonrpc_core::futures::Future;
+use jsonrpc_core::futures::{future, Future};
 use jsonrpc_macros::Trailing;
-use v1::helpers::{self, errors, ipfs, SigningQueue, SignerService, NetworkSettings};
+use v1::helpers::{self, errors, ipfs, SigningQueue, SignerService, NetworkSettings, verify_signature};
 use v1::helpers::dispatch::LightDispatcher;
-use v1::helpers::light_fetch::LightFetch;
+use v1::helpers::light_fetch::{LightFetch, light_all_transactions};
 use v1::metadata::Metadata;
 use v1::traits::Parity;
 use v1::types::{
-	Bytes, U256, U64, H160, H256, H512, CallRequest,
+	Bytes, U256, U64, H64, H160, H256, H512, CallRequest,
 	Peers, Transaction, RpcSettings, Histogram,
 	TransactionStats, LocalTransactionStatus,
-	BlockNumber, LightBlockNumber, ConsensusCapability, VersionInfo,
-	OperationsInfo, ChainStatus,
-	AccountInfo, HwAccountInfo, Header, RichHeader, Receipt,
+	LightBlockNumber, ChainStatus, Receipt,
+	BlockNumber, ConsensusCapability, VersionInfo,
+	OperationsInfo, AccountInfo, HwAccountInfo, Header, RichHeader, RecoveredAccount,
+	Log, Filter,
 };
 use Host;
 
 /// Parity implementation for light client.
 pub struct ParityClient {
-	client: Arc<LightChainClient>,
 	light_dispatch: Arc<LightDispatcher>,
 	accounts: Arc<AccountProvider>,
 	logger: Arc<RotatingLogger>,
@@ -62,7 +60,6 @@ pub struct ParityClient {
 impl ParityClient {
 	/// Creates new `ParityClient`.
 	pub fn new(
-		client: Arc<LightChainClient>,
 		light_dispatch: Arc<LightDispatcher>,
 		accounts: Arc<AccountProvider>,
 		logger: Arc<RotatingLogger>,
@@ -78,7 +75,6 @@ impl ParityClient {
 			settings,
 			signer,
 			ws_address,
-			client,
 			gas_price_percentile,
 		}
 	}
@@ -263,17 +259,18 @@ impl Parity for ParityClient {
 	}
 
 	fn all_transactions(&self) -> Result<Vec<Transaction>> {
-		let txq = self.light_dispatch.transaction_queue.read();
-		let chain_info = self.light_dispatch.client.chain_info();
-
-		let current = txq.ready_transactions(chain_info.best_block_number, chain_info.best_block_timestamp);
-		let future = txq.future_transactions(chain_info.best_block_number, chain_info.best_block_timestamp);
 		Ok(
-			current
-				.into_iter()
-				.chain(future.into_iter())
+			light_all_transactions(&self.light_dispatch)
 				.map(|tx| Transaction::from_pending(tx))
-				.collect::<Vec<_>>()
+				.collect()
+		)
+	}
+
+	fn all_transaction_hashes(&self) -> Result<Vec<H256>> {
+		Ok(
+			light_all_transactions(&self.light_dispatch)
+				.map(|tx| tx.transaction.hash().into())
+				.collect()
 		)
 	}
 
@@ -328,10 +325,6 @@ impl Parity for ParityClient {
 		Err(errors::light_unimplemented(None))
 	}
 
-	fn chain_id(&self) -> Result<Option<U64>> {
-		Ok(self.client.signing_chain_id().map(U64::from))
-	}
-
 	fn chain(&self) -> Result<String> {
 		Ok(self.settings.chain.clone())
 	}
@@ -373,7 +366,7 @@ impl Parity for ParityClient {
 	}
 
 	fn block_header(&self, number: Trailing<BlockNumber>) -> BoxFuture<RichHeader> {
-		use ethcore::encoded;
+		use types::encoded;
 
 		let engine = self.light_dispatch.client.engine().clone();
 		let from_encoded = move |encoded: encoded::Header| {
@@ -417,5 +410,32 @@ impl Parity for ParityClient {
 
 	fn call(&self, _requests: Vec<CallRequest>, _block: Trailing<BlockNumber>) -> Result<Vec<Bytes>> {
 		Err(errors::light_unimplemented(None))
+	}
+
+	fn submit_work_detail(&self, _nonce: H64, _pow_hash: H256, _mix_hash: H256) -> Result<H256> {
+		Err(errors::light_unimplemented(None))
+	}
+
+	fn status(&self) -> Result<()> {
+		let has_peers = self.settings.is_dev_chain || self.light_dispatch.sync.peer_numbers().connected > 0;
+		let is_importing = self.light_dispatch.sync.is_major_importing();
+
+		if has_peers && !is_importing {
+			Ok(())
+		} else {
+			Err(errors::status_error(has_peers))
+		}
+	}
+
+	fn logs_no_tx_hash(&self, filter: Filter) -> BoxFuture<Vec<Log>> {
+    let filter = match filter.try_into() {
+			Ok(value) => value,
+			Err(err) => return Box::new(future::err(err)),
+		};
+		Box::new(self.fetcher().logs_no_tx_hash(filter)) as BoxFuture<_>
+	}
+
+	fn verify_signature(&self, is_prefixed: bool, message: Bytes, r: H256, s: H256, v: U64) -> Result<RecoveredAccount> {
+		verify_signature(is_prefixed, message, r, s, v, self.light_dispatch.client.signing_chain_id())
 	}
 }

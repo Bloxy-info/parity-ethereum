@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Eth RPC interface for the light client.
 
@@ -30,15 +30,15 @@ use light::{cht, TransactionQueue};
 use light::on_demand::{request, OnDemand};
 
 use ethcore::account_provider::AccountProvider;
-use ethcore::encoded;
-use ethcore::filter::Filter as EthcoreFilter;
-use ethcore::ids::BlockId;
-use sync::LightSync;
-use hash::{KECCAK_NULL_RLP, KECCAK_EMPTY_LIST_RLP};
 use ethereum_types::U256;
+use hash::{KECCAK_NULL_RLP, KECCAK_EMPTY_LIST_RLP};
 use parking_lot::{RwLock, Mutex};
 use rlp::Rlp;
-use transaction::SignedTransaction;
+use sync::LightSync;
+use types::transaction::SignedTransaction;
+use types::encoded;
+use types::filter::Filter as EthcoreFilter;
+use types::ids::BlockId;
 
 use v1::impls::eth_filter::Filterable;
 use v1::helpers::{errors, limit_logs};
@@ -47,8 +47,9 @@ use v1::helpers::light_fetch::{self, LightFetch};
 use v1::traits::Eth;
 use v1::types::{
 	RichBlock, Block, BlockTransactions, BlockNumber, LightBlockNumber, Bytes, SyncStatus, SyncInfo,
-	Transaction, CallRequest, Index, Filter, Log, Receipt, Work,
+	Transaction, CallRequest, Index, Filter, Log, Receipt, Work, EthAccount,
 	H64 as RpcH64, H256 as RpcH256, H160 as RpcH160, U256 as RpcU256,
+	U64 as RpcU64,
 };
 use v1::metadata::Metadata;
 
@@ -199,7 +200,7 @@ impl<T: LightChainClient + 'static> EthClient<T> {
 								};
 
 								fill_rich(block, score)
-							}).map_err(errors::on_demand_cancel)),
+							}).map_err(errors::on_demand_error)),
 						None => Either::A(future::err(errors::network_disabled())),
 					}
 				}
@@ -244,6 +245,10 @@ impl<T: LightChainClient + 'static> Eth for EthClient<T> {
 
 	fn is_mining(&self) -> Result<bool> {
 		Ok(false)
+	}
+
+	fn chain_id(&self) -> Result<Option<RpcU64>> {
+		Ok(self.client.signing_chain_id().map(RpcU64::from))
 	}
 
 	fn hashrate(&self) -> Result<RpcU256> {
@@ -299,7 +304,7 @@ impl<T: LightChainClient + 'static> Eth for EthClient<T> {
 				sync.with_context(|ctx| on_demand.request(ctx, request::Body(hdr.into())))
 					.map(|x| x.expect(NO_INVALID_BACK_REFS))
 					.map(|x| x.map(|b| Some(U256::from(b.transactions_count()).into())))
-					.map(|x| Either::B(x.map_err(errors::on_demand_cancel)))
+					.map(|x| Either::B(x.map_err(errors::on_demand_error)))
 					.unwrap_or_else(|| Either::A(future::err(errors::network_disabled())))
 			}
 		}))
@@ -315,7 +320,7 @@ impl<T: LightChainClient + 'static> Eth for EthClient<T> {
 				sync.with_context(|ctx| on_demand.request(ctx, request::Body(hdr.into())))
 					.map(|x| x.expect(NO_INVALID_BACK_REFS))
 					.map(|x| x.map(|b| Some(U256::from(b.transactions_count()).into())))
-					.map(|x| Either::B(x.map_err(errors::on_demand_cancel)))
+					.map(|x| Either::B(x.map_err(errors::on_demand_error)))
 					.unwrap_or_else(|| Either::A(future::err(errors::network_disabled())))
 			}
 		}))
@@ -331,7 +336,7 @@ impl<T: LightChainClient + 'static> Eth for EthClient<T> {
 				sync.with_context(|ctx| on_demand.request(ctx, request::Body(hdr.into())))
 					.map(|x| x.expect(NO_INVALID_BACK_REFS))
 					.map(|x| x.map(|b| Some(U256::from(b.uncles_count()).into())))
-					.map(|x| Either::B(x.map_err(errors::on_demand_cancel)))
+					.map(|x| Either::B(x.map_err(errors::on_demand_error)))
 					.unwrap_or_else(|| Either::A(future::err(errors::network_disabled())))
 			}
 		}))
@@ -347,7 +352,7 @@ impl<T: LightChainClient + 'static> Eth for EthClient<T> {
 				sync.with_context(|ctx| on_demand.request(ctx, request::Body(hdr.into())))
 					.map(|x| x.expect(NO_INVALID_BACK_REFS))
 					.map(|x| x.map(|b| Some(U256::from(b.uncles_count()).into())))
-					.map(|x| Either::A(x.map_err(errors::on_demand_cancel)))
+					.map(|x| Either::A(x.map_err(errors::on_demand_error)))
 					.unwrap_or_else(|| Either::B(future::err(errors::network_disabled())))
 			}
 		}))
@@ -468,6 +473,10 @@ impl<T: LightChainClient + 'static> Eth for EthClient<T> {
 		Box::new(self.fetcher().block(num.to_block_id()).map(move |block| {
 			extract_uncle_at_index(block, idx, client)
 		}))
+	}
+
+	fn proof(&self, _address: RpcH160, _values:Vec<RpcH256>, _num: Trailing<BlockNumber>) -> BoxFuture<EthAccount> {
+		Box::new(future::err(errors::unimplemented(None)))
 	}
 
 	fn compilers(&self) -> Result<Vec<String>> {

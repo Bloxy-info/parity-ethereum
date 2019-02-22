@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Utilities and helpers for transaction dispatch.
 
@@ -30,25 +30,27 @@ use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use stats::Corpus;
 
-use ethkey::{Password, Signature};
-use sync::LightSync;
-use ethcore::ids::BlockId;
+use crypto::DEFAULT_MAC;
+use ethcore::account_provider::AccountProvider;
 use ethcore::client::BlockChainClient;
 use ethcore::miner::{self, MinerService};
-use ethcore::account_provider::AccountProvider;
-use crypto::DEFAULT_MAC;
-use transaction::{Action, SignedTransaction, PendingTransaction, Transaction};
+use ethkey::{Password, Signature};
+use sync::LightSync;
+use types::transaction::{Action, SignedTransaction, PendingTransaction, Transaction, Error as TransactionError};
+use types::basic_account::BasicAccount;
+use types::ids::BlockId;
 
 use jsonrpc_core::{BoxFuture, Result, Error};
-use jsonrpc_core::futures::{future, Future, Poll, Async};
+use jsonrpc_core::futures::{future, Future, Poll, Async, IntoFuture};
 use jsonrpc_core::futures::future::Either;
 use v1::helpers::{errors, nonce, TransactionRequest, FilledTransactionRequest, ConfirmationPayload};
 use v1::types::{
-	H256 as RpcH256, H520 as RpcH520, Bytes as RpcBytes,
+	H520 as RpcH520, Bytes as RpcBytes,
 	RichRawTransaction as RpcRichRawTransaction,
 	ConfirmationPayload as RpcConfirmationPayload,
 	ConfirmationResponse,
-	SignRequest as RpcSignRequest,
+	EthSignRequest as RpcEthSignRequest,
+	EIP191SignRequest as RpcSignRequest,
 	DecryptRequest as RpcDecryptRequest,
 };
 use rlp;
@@ -67,12 +69,20 @@ pub trait Dispatcher: Send + Sync + Clone {
 	fn fill_optional_fields(&self, request: TransactionRequest, default_sender: Address, force_nonce: bool)
 		-> BoxFuture<FilledTransactionRequest>;
 
-	/// Sign the given transaction request without dispatching, fetching appropriate nonce.
-	fn sign(&self, accounts: Arc<AccountProvider>, filled: FilledTransactionRequest, password: SignWith)
-		-> BoxFuture<WithToken<SignedTransaction>>;
+	/// Sign the given transaction request, fetching appropriate nonce and executing the PostSign action
+	fn sign<P>(
+		&self,
+		accounts: Arc<AccountProvider>,
+		filled: FilledTransactionRequest,
+		password: SignWith,
+		post_sign: P
+	) -> BoxFuture<P::Item>
+		where
+			P: PostSign + 'static,
+		    <P::Out as futures::future::IntoFuture>::Future: Send;
 
 	/// Converts a `SignedTransaction` into `RichRawTransaction`
-	fn enrich(&self, SignedTransaction) -> RpcRichRawTransaction;
+	fn enrich(&self, signed: SignedTransaction) -> RpcRichRawTransaction;
 
 	/// "Dispatch" a local transaction.
 	fn dispatch_transaction(&self, signed_transaction: PendingTransaction)
@@ -162,19 +172,30 @@ impl<C: miner::BlockChainClient + BlockChainClient, M: MinerService> Dispatcher 
 		}))
 	}
 
-	fn sign(&self, accounts: Arc<AccountProvider>, filled: FilledTransactionRequest, password: SignWith)
-		-> BoxFuture<WithToken<SignedTransaction>>
+	fn sign<P>(
+		&self,
+		accounts: Arc<AccountProvider>,
+		filled: FilledTransactionRequest,
+		password: SignWith,
+		post_sign: P
+	) -> BoxFuture<P::Item>
+		where
+			P: PostSign + 'static,
+		    <P::Out as futures::future::IntoFuture>::Future: Send
 	{
 		let chain_id = self.client.signing_chain_id();
 
 		if let Some(nonce) = filled.nonce {
-			return Box::new(future::done(sign_transaction(&*accounts, filled, chain_id, nonce, password)));
+			let future = sign_transaction(&*accounts, filled, chain_id, nonce, password)
+				.into_future()
+				.and_then(move |signed| post_sign.execute(signed));
+			Box::new(future)
+		} else {
+			let state = self.state_nonce(&filled.from);
+			let reserved = self.nonces.lock().reserve(filled.from, state);
+
+			Box::new(ProspectiveSigner::new(accounts, filled, chain_id, reserved, password, post_sign))
 		}
-
-		let state = self.state_nonce(&filled.from);
-		let reserved = self.nonces.lock().reserve(filled.from, state);
-
-		Box::new(ProspectiveSigner::new(accounts, filled, chain_id, reserved, password))
 	}
 
 	fn enrich(&self, signed_transaction: SignedTransaction) -> RpcRichRawTransaction {
@@ -218,7 +239,6 @@ pub fn fetch_gas_price_corpus(
 					for t in block.transaction_views().iter() {
 						v.push(t.gas_price())
 					}
-
 					v
 				})
 			})
@@ -302,40 +322,42 @@ impl LightDispatcher {
 		)
 	}
 
-	/// Get an account's next nonce.
-	pub fn next_nonce(&self, addr: Address) -> BoxFuture<U256> {
-		// fast path where we don't go to network; nonce provided or can be gotten from queue.
-		let maybe_nonce = self.transaction_queue.read().next_nonce(&addr);
-		if let Some(nonce) = maybe_nonce {
-			return Box::new(future::ok(nonce))
-		}
-
+	/// Get an account's state
+	fn account(&self, addr: Address) -> BoxFuture<Option<BasicAccount>> {
 		let best_header = self.client.best_block_header();
-		let account_start_nonce = self.client.engine().account_start_nonce(best_header.number());
-		let nonce_future = self.sync.with_context(|ctx| self.on_demand.request(ctx, request::Account {
+		let account_future = self.sync.with_context(|ctx| self.on_demand.request(ctx, request::Account {
 			header: best_header.into(),
 			address: addr,
 		}).expect("no back-references; therefore all back-references valid; qed"));
 
-		match nonce_future {
-			Some(x) => Box::new(
-				x.map(move |acc| acc.map_or(account_start_nonce, |acc| acc.nonce))
-					.map_err(|_| errors::no_light_peers())
-			),
-			None => Box::new(future::err(errors::network_disabled()))
+		match account_future {
+			Some(response) => Box::new(response.map_err(|_| errors::no_light_peers())),
+			None => Box::new(future::err(errors::network_disabled())),
 		}
+	}
+
+	/// Get an account's next nonce.
+	pub fn next_nonce(&self, addr: Address) -> BoxFuture<U256> {
+		let account_start_nonce = self.client.engine().account_start_nonce(self.client.best_block_header().number());
+		Box::new(self.account(addr)
+			.and_then(move |maybe_account| {
+				future::ok(maybe_account.map_or(account_start_nonce, |account| account.nonce))
+			})
+		)
 	}
 }
 
 impl Dispatcher for LightDispatcher {
-	fn fill_optional_fields(&self, request: TransactionRequest, default_sender: Address, force_nonce: bool)
+	// Ignore the `force_nonce` flag in order to always query the network when fetching the nonce and
+	// the account state. If the nonce is specified in the transaction use that nonce instead but do the
+	// network request anyway to the account state (balance)
+	fn fill_optional_fields(&self, request: TransactionRequest, default_sender: Address, _force_nonce: bool)
 		-> BoxFuture<FilledTransactionRequest>
 	{
 		const DEFAULT_GAS_PRICE: U256 = U256([0, 0, 0, 21_000_000]);
 
 		let gas_limit = self.client.best_block_header().gas_limit();
 		let request_gas_price = request.gas_price.clone();
-		let request_nonce = request.nonce.clone();
 		let from = request.from.unwrap_or(default_sender);
 
 		let with_gas_price = move |gas_price| {
@@ -368,39 +390,49 @@ impl Dispatcher for LightDispatcher {
 			}).map(with_gas_price))
 		};
 
-		match (request_nonce, force_nonce) {
-			(_, false) | (Some(_), true) => Box::new(gas_price),
-			(None, true) => {
-				let next_nonce = self.next_nonce(from);
-				Box::new(gas_price.and_then(move |mut filled| next_nonce
-					.map_err(|_| errors::no_light_peers())
-					.map(move |nonce| {
-						filled.nonce = Some(nonce);
-						filled
-					})
-				))
-			},
-		}
+		let future_account = self.account(from);
+
+		Box::new(gas_price.and_then(move |mut filled| {
+			future_account
+				.and_then(move |maybe_account| {
+					let cost = filled.value.saturating_add(filled.gas.saturating_mul(filled.gas_price));
+					match maybe_account {
+						Some(ref account) if cost > account.balance => {
+							Err(errors::transaction(TransactionError::InsufficientBalance {
+								balance: account.balance,
+								cost,
+							}))
+						}
+						Some(account) => {
+							if filled.nonce.is_none() {
+								filled.nonce = Some(account.nonce);
+							}
+							Ok(filled)
+						}
+						None => Err(errors::account("Account not found", "")),
+					}
+				})
+		}))
 	}
 
-	fn sign(&self, accounts: Arc<AccountProvider>, filled: FilledTransactionRequest, password: SignWith)
-		-> BoxFuture<WithToken<SignedTransaction>>
+	fn sign<P>(
+		&self,
+		accounts: Arc<AccountProvider>,
+		filled: FilledTransactionRequest,
+		password: SignWith,
+		post_sign: P
+	) -> BoxFuture<P::Item>
+		where
+			P: PostSign + 'static,
+		    <P::Out as futures::future::IntoFuture>::Future: Send
 	{
 		let chain_id = self.client.signing_chain_id();
+		let nonce = filled.nonce.expect("nonce is always provided; qed");
 
-		// fast path for pre-filled nonce.
-		if let Some(nonce) = filled.nonce {
-			return Box::new(future::done(sign_transaction(&*accounts, filled, chain_id, nonce, password)))
-		}
-
-		let nonces = self.nonces.clone();
-		Box::new(self.next_nonce(filled.from)
-			.map_err(|_| errors::no_light_peers())
-			.and_then(move |nonce| {
-				let reserved = nonces.lock().reserve(filled.from, nonce);
-
-				ProspectiveSigner::new(accounts, filled, chain_id, reserved, password)
-			}))
+		let future = sign_transaction(&*accounts, filled, chain_id, nonce, password)
+			.into_future()
+			.and_then(move |signed| post_sign.execute(signed));
+		Box::new(future)
 	}
 
 	fn enrich(&self, signed_transaction: SignedTransaction) -> RpcRichRawTransaction {
@@ -448,28 +480,60 @@ fn sign_transaction(
 #[derive(Debug, Clone, Copy)]
 enum ProspectiveSignerState {
 	TryProspectiveSign,
+	WaitForPostSign,
 	WaitForNonce,
-	Finish,
 }
 
-struct ProspectiveSigner {
+struct ProspectiveSigner<P: PostSign> {
 	accounts: Arc<AccountProvider>,
 	filled: FilledTransactionRequest,
 	chain_id: Option<u64>,
 	reserved: nonce::Reserved,
 	password: SignWith,
 	state: ProspectiveSignerState,
-	prospective: Option<Result<WithToken<SignedTransaction>>>,
+	prospective: Option<WithToken<SignedTransaction>>,
 	ready: Option<nonce::Ready>,
+	post_sign: Option<P>,
+	post_sign_future: Option<<P::Out as IntoFuture>::Future>
 }
 
-impl ProspectiveSigner {
+/// action to execute after signing
+/// e.g importing a transaction into the chain
+pub trait PostSign: Send {
+	/// item that this PostSign returns
+	type Item: Send;
+	/// incase you need to perform async PostSign actions
+	type Out: IntoFuture<Item = Self::Item, Error = Error> + Send;
+	/// perform an action with the signed transaction
+	fn execute(self, signer: WithToken<SignedTransaction>) -> Self::Out;
+}
+
+impl PostSign for () {
+	type Item = WithToken<SignedTransaction>;
+	type Out = Result<Self::Item>;
+	fn execute(self, signed: WithToken<SignedTransaction>) -> Self::Out {
+		Ok(signed)
+	}
+}
+
+impl<F: Send, T: Send> PostSign for F
+	where F: FnOnce(WithToken<SignedTransaction>) -> Result<T>
+{
+	type Item = T;
+	type Out = Result<Self::Item>;
+	fn execute(self, signed: WithToken<SignedTransaction>) -> Self::Out {
+		(self)(signed)
+	}
+}
+
+impl<P: PostSign> ProspectiveSigner<P> {
 	pub fn new(
 		accounts: Arc<AccountProvider>,
 		filled: FilledTransactionRequest,
 		chain_id: Option<u64>,
 		reserved: nonce::Reserved,
 		password: SignWith,
+		post_sign: P
 	) -> Self {
 		// If the account is permanently unlocked we can try to sign
 		// using prospective nonce. This should speed up sending
@@ -490,6 +554,8 @@ impl ProspectiveSigner {
 			},
 			prospective: None,
 			ready: None,
+			post_sign: Some(post_sign),
+			post_sign_future: None
 		}
 	}
 
@@ -508,8 +574,8 @@ impl ProspectiveSigner {
 	}
 }
 
-impl Future for ProspectiveSigner {
-	type Item = WithToken<SignedTransaction>;
+impl<P: PostSign> Future for ProspectiveSigner<P> {
+	type Item = P::Item;
 	type Error = Error;
 
 	fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
@@ -522,32 +588,45 @@ impl Future for ProspectiveSigner {
 					match self.poll_reserved()? {
 						Async::NotReady => {
 							self.state = WaitForNonce;
-							self.prospective = Some(self.sign(self.reserved.prospective_value()));
+							self.prospective = Some(self.sign(self.reserved.prospective_value())?);
 						},
 						Async::Ready(nonce) => {
-							self.state = Finish;
-							self.prospective = Some(self.sign(nonce.value()));
+							self.state = WaitForPostSign;
+							self.post_sign_future = Some(self.post_sign.take()
+								.expect("post_sign is set on creation; qed")
+								.execute(self.sign(nonce.value())?)
+								.into_future());
 							self.ready = Some(nonce);
 						},
 					}
 				},
 				WaitForNonce => {
 					let nonce = try_ready!(self.poll_reserved());
-					let result = match (self.prospective.take(), nonce.matches_prospective()) {
+					let prospective = match (self.prospective.take(), nonce.matches_prospective()) {
 						(Some(prospective), true) => prospective,
-						_ => self.sign(nonce.value()),
+						_ => self.sign(nonce.value())?,
 					};
-					self.state = Finish;
-					self.prospective = Some(result);
 					self.ready = Some(nonce);
+					self.state = WaitForPostSign;
+					self.post_sign_future = Some(self.post_sign.take()
+						.expect("post_sign is set on creation; qed")
+						.execute(prospective)
+						.into_future());
 				},
-				Finish => {
-					if let (Some(result), Some(nonce)) = (self.prospective.take(), self.ready.take()) {
-						// Mark nonce as used on successful signing
-						return result.map(move |tx| {
-							nonce.mark_used();
-							Async::Ready(tx)
-						})
+				WaitForPostSign => {
+					if let Some(mut fut) = self.post_sign_future.as_mut() {
+						match fut.poll()? {
+							Async::Ready(item) => {
+								let nonce = self.ready
+									.take()
+									.expect("nonce is set before state transitions to WaitForPostSign; qed");
+								nonce.mark_used();
+								return Ok(Async::Ready(item))
+							},
+							Async::NotReady => {
+								return Ok(Async::NotReady)
+							}
+						}
 					} else {
 						panic!("Poll after ready.");
 					}
@@ -654,19 +733,21 @@ pub fn execute<D: Dispatcher + 'static>(
 	match payload {
 		ConfirmationPayload::SendTransaction(request) => {
 			let condition = request.condition.clone().map(Into::into);
-			Box::new(dispatcher.sign(accounts, request, pass)
-				.map(move |v| v.map(move |tx| PendingTransaction::new(tx, condition)))
-				.map(WithToken::into_tuple)
-				.map(|(tx, token)| (tx, token, dispatcher))
-				.and_then(|(tx, tok, dispatcher)| {
-					dispatcher.dispatch_transaction(tx)
-						.map(RpcH256::from)
-						.map(ConfirmationResponse::SendTransaction)
-						.map(move |h| WithToken::from((h, tok)))
-				}))
+			let cloned_dispatcher = dispatcher.clone();
+			let post_sign = move |with_token_signed: WithToken<SignedTransaction>| {
+				let (signed, token) = with_token_signed.into_tuple();
+				let signed_transaction = PendingTransaction::new(signed, condition);
+				cloned_dispatcher.dispatch_transaction(signed_transaction)
+					.map(|hash| (hash, token))
+			};
+			let future = dispatcher.sign(accounts, request, pass, post_sign)
+				.map(|(hash, token)| {
+					WithToken::from((ConfirmationResponse::SendTransaction(hash.into()), token))
+				});
+			Box::new(future)
 		},
 		ConfirmationPayload::SignTransaction(request) => {
-			Box::new(dispatcher.sign(accounts, request, pass)
+			Box::new(dispatcher.sign(accounts, request, pass, ())
 				.map(move |result| result
 					.map(move |tx| dispatcher.enrich(tx))
 					.map(ConfirmationResponse::SignTransaction)
@@ -686,6 +767,19 @@ pub fn execute<D: Dispatcher + 'static>(
 			}
 			let hash = eth_data_hash(data);
 			let res = signature(&accounts, address, hash, pass)
+				.map(|result| result
+					.map(|rsv| H520(rsv.into_electrum()))
+					.map(RpcH520::from)
+					.map(ConfirmationResponse::Signature)
+				);
+			Box::new(future::done(res))
+		},
+		ConfirmationPayload::SignMessage(address, data) => {
+			if accounts.is_hardware_address(&address) {
+				return Box::new(future::err(errors::account("Error signing message with hardware_wallet",
+					"Message signing is unsupported")));
+			}
+			let res = signature(&accounts, address, data, pass)
 				.map(|result| result
 					.map(|rsv| H520(rsv.into_electrum()))
 					.map(RpcH520::from)
@@ -775,8 +869,11 @@ pub fn from_rpc<D>(payload: RpcConfirmationPayload, default_account: Address, di
 		RpcConfirmationPayload::Decrypt(RpcDecryptRequest { address, msg }) => {
 			Box::new(future::ok(ConfirmationPayload::Decrypt(address.into(), msg.into())))
 		},
-		RpcConfirmationPayload::EthSignMessage(RpcSignRequest { address, data }) => {
+		RpcConfirmationPayload::EthSignMessage(RpcEthSignRequest { address, data }) => {
 			Box::new(future::ok(ConfirmationPayload::EthSignMessage(address.into(), data.into())))
+		},
+		RpcConfirmationPayload::EIP191SignMessage(RpcSignRequest { address, data }) => {
+			Box::new(future::ok(ConfirmationPayload::SignMessage(address.into(), data.into())))
 		},
 	}
 }

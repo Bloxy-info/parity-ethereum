@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Private transactions module.
 
@@ -25,27 +25,28 @@ mod private_transactions;
 mod messages;
 mod error;
 
+extern crate common_types as types;
+extern crate ethabi;
 extern crate ethcore;
-extern crate parity_bytes as bytes;
-extern crate parity_crypto as crypto;
+extern crate ethcore_call_contract as call_contract;
 extern crate ethcore_io as io;
 extern crate ethcore_miner;
-extern crate ethcore_transaction as transaction;
-extern crate ethabi;
 extern crate ethereum_types;
-extern crate ethkey;
 extern crate ethjson;
+extern crate ethkey;
 extern crate fetch;
 extern crate futures;
 extern crate heapsize;
 extern crate keccak_hash as hash;
+extern crate parity_bytes as bytes;
+extern crate parity_crypto as crypto;
 extern crate parking_lot;
 extern crate patricia_trie as trie;
-extern crate transaction_pool as txpool;
 extern crate patricia_trie_ethereum as ethtrie;
 extern crate rlp;
-extern crate url;
 extern crate rustc_hex;
+extern crate transaction_pool as txpool;
+extern crate url;
 #[macro_use]
 extern crate log;
 #[macro_use]
@@ -60,7 +61,7 @@ extern crate rlp_derive;
 #[cfg(test)]
 extern crate rand;
 #[cfg(test)]
-extern crate ethcore_logger;
+extern crate env_logger;
 
 pub use encryptor::{Encryptor, SecretStoreEncryptor, EncryptorConfig, NoopEncryptor};
 pub use private_transactions::{VerifiedPrivateTransaction, VerificationStore, PrivateTransactionSigningDesc, SigningStore};
@@ -68,8 +69,7 @@ pub use messages::{PrivateTransaction, SignedPrivateTransaction};
 pub use error::{Error, ErrorKind};
 
 use std::sync::{Arc, Weak};
-use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::collections::{HashMap, HashSet, BTreeMap};
 use ethereum_types::{H128, H256, U256, Address};
 use hash::keccak;
 use rlp::*;
@@ -79,27 +79,36 @@ use ethkey::{Signature, recover, public_to_address};
 use io::IoChannel;
 use ethcore::executive::{Executive, TransactOptions};
 use ethcore::executed::{Executed};
-use transaction::{SignedTransaction, Transaction, Action, UnverifiedTransaction};
+use types::transaction::{SignedTransaction, Transaction, Action, UnverifiedTransaction};
 use ethcore::{contract_address as ethcore_contract_address};
 use ethcore::client::{
-	Client, ChainNotify, ChainRoute, ChainMessageType, ClientIoMessage, BlockId, CallContract
+	Client, ChainNotify, NewBlocks, ChainMessageType, ClientIoMessage, BlockId,
+	Call, BlockInfo
 };
 use ethcore::account_provider::AccountProvider;
 use ethcore::miner::{self, Miner, MinerService, pool_client::NonceCache};
 use ethcore::trace::{Tracer, VMTracer};
+use call_contract::CallContract;
 use rustc_hex::FromHex;
 use ethkey::Password;
+use ethabi::FunctionOutputDecoder;
 
 // Source avaiable at https://github.com/parity-contracts/private-tx/blob/master/contracts/PrivateContract.sol
 const DEFAULT_STUB_CONTRACT: &'static str = include_str!("../res/private.evm");
 
-use_contract!(private, "PrivateContract", "res/private.json");
+use_contract!(private_contract, "res/private.json");
 
 /// Initialization vector length.
 const INIT_VEC_LEN: usize = 16;
 
 /// Size of nonce cache
 const NONCE_CACHE_SIZE: usize = 128;
+
+/// Version for the initial private contract wrapper
+const INITIAL_PRIVATE_CONTRACT_VER: usize = 1;
+
+/// Version for the private contract notification about private state changes added
+const PRIVATE_CONTRACT_WITH_NOTIFICATION_VER: usize = 2;
 
 /// Configurtion for private transaction provider
 #[derive(Default, PartialEq, Debug, Clone)]
@@ -197,36 +206,30 @@ impl Provider where {
 			bail!(ErrorKind::SignerAccountNotSet);
 		}
 		let tx_hash = signed_transaction.hash();
-		match signed_transaction.action {
-			Action::Create => {
-				bail!(ErrorKind::BadTransactonType);
-			}
-			Action::Call(contract) => {
-				let data = signed_transaction.rlp_bytes();
-				let encrypted_transaction = self.encrypt(&contract, &Self::iv_from_transaction(&signed_transaction), &data)?;
-				let private = PrivateTransaction::new(encrypted_transaction, contract);
-				// TODO [ToDr] Using BlockId::Latest is bad here,
-				// the block may change in the middle of execution
-				// causing really weird stuff to happen.
-				// We should retrieve hash and stick to that. IMHO
-				// best would be to change the API and only allow H256 instead of BlockID
-				// in private-tx to avoid such mistakes.
-				let contract_nonce = self.get_contract_nonce(&contract, BlockId::Latest)?;
-				let private_state = self.execute_private_transaction(BlockId::Latest, &signed_transaction)?;
-				trace!(target: "privatetx", "Private transaction created, encrypted transaction: {:?}, private state: {:?}", private, private_state);
-				let contract_validators = self.get_validators(BlockId::Latest, &contract)?;
-				trace!(target: "privatetx", "Required validators: {:?}", contract_validators);
-				let private_state_hash = self.calculate_state_hash(&private_state, contract_nonce);
-				trace!(target: "privatetx", "Hashed effective private state for sender: {:?}", private_state_hash);
-				self.transactions_for_signing.write().add_transaction(private.hash(), signed_transaction, contract_validators, private_state, contract_nonce)?;
-				self.broadcast_private_transaction(private.hash(), private.rlp_bytes());
-				Ok(Receipt {
-					hash: tx_hash,
-					contract_address: Some(contract),
-					status_code: 0,
-				})
-			}
-		}
+		let contract = Self::contract_address_from_transaction(&signed_transaction).map_err(|_| ErrorKind::BadTransactonType)?;
+		let data = signed_transaction.rlp_bytes();
+		let encrypted_transaction = self.encrypt(&contract, &Self::iv_from_transaction(&signed_transaction), &data)?;
+		let private = PrivateTransaction::new(encrypted_transaction, contract);
+		// TODO #9825 [ToDr] Using BlockId::Latest is bad here,
+		// the block may change in the middle of execution
+		// causing really weird stuff to happen.
+		// We should retrieve hash and stick to that. IMHO
+		// best would be to change the API and only allow H256 instead of BlockID
+		// in private-tx to avoid such mistakes.
+		let contract_nonce = self.get_contract_nonce(&contract, BlockId::Latest)?;
+		let private_state = self.execute_private_transaction(BlockId::Latest, &signed_transaction)?;
+		trace!(target: "privatetx", "Private transaction created, encrypted transaction: {:?}, private state: {:?}", private, private_state);
+		let contract_validators = self.get_validators(BlockId::Latest, &contract)?;
+		trace!(target: "privatetx", "Required validators: {:?}", contract_validators);
+		let private_state_hash = self.calculate_state_hash(&private_state, contract_nonce);
+		trace!(target: "privatetx", "Hashed effective private state for sender: {:?}", private_state_hash);
+		self.transactions_for_signing.write().add_transaction(private.hash(), signed_transaction, contract_validators, private_state, contract_nonce)?;
+		self.broadcast_private_transaction(private.hash(), private.rlp_bytes());
+		Ok(Receipt {
+			hash: tx_hash,
+			contract_address: Some(contract),
+			status_code: 0,
+		})
 	}
 
 	/// Calculate hash from united private state and contract nonce
@@ -267,33 +270,30 @@ impl Provider where {
 						self.broadcast_private_transaction(private_hash, transaction.private_transaction.rlp_bytes());
 						return Ok(());
 					}
-					let tx_action = transaction.transaction.action.clone();
-					if let Action::Call(contract) = tx_action {
-						// TODO [ToDr] Usage of BlockId::Latest
-						let contract_nonce = self.get_contract_nonce(&contract, BlockId::Latest);
-						if let Err(e) = contract_nonce {
-							bail!("Cannot retrieve contract nonce: {:?}", e);
-						}
-						let contract_nonce = contract_nonce.expect("Error was checked before");
-						let private_state = self.execute_private_transaction(BlockId::Latest, &transaction.transaction);
-						if let Err(e) = private_state {
-							bail!("Cannot retrieve private state: {:?}", e);
-						}
-						let private_state = private_state.expect("Error was checked before");
-						let private_state_hash = self.calculate_state_hash(&private_state, contract_nonce);
-						trace!(target: "privatetx", "Hashed effective private state for validator: {:?}", private_state_hash);
-						let password = find_account_password(&self.passwords, &*self.accounts, &validator_account);
-						let signed_state = self.accounts.sign(validator_account, password, private_state_hash);
-						if let Err(e) = signed_state {
-							bail!("Cannot sign the state: {:?}", e);
-						}
-						let signed_state = signed_state.expect("Error was checked before");
-						let signed_private_transaction = SignedPrivateTransaction::new(private_hash, signed_state, None);
-						trace!(target: "privatetx", "Sending signature for private transaction: {:?}", signed_private_transaction);
-						self.broadcast_signed_private_transaction(signed_private_transaction.hash(), signed_private_transaction.rlp_bytes());
-					} else {
-						bail!("Incorrect type of action for the transaction");
+					let contract = Self::contract_address_from_transaction(&transaction.transaction)
+						.map_err(|_| "Incorrect type of action for the transaction")?;
+					// TODO #9825 [ToDr] Usage of BlockId::Latest
+					let contract_nonce = self.get_contract_nonce(&contract, BlockId::Latest);
+					if let Err(e) = contract_nonce {
+						bail!("Cannot retrieve contract nonce: {:?}", e);
 					}
+					let contract_nonce = contract_nonce.expect("Error was checked before");
+					let private_state = self.execute_private_transaction(BlockId::Latest, &transaction.transaction);
+					if let Err(e) = private_state {
+						bail!("Cannot retrieve private state: {:?}", e);
+					}
+					let private_state = private_state.expect("Error was checked before");
+					let private_state_hash = self.calculate_state_hash(&private_state, contract_nonce);
+					trace!(target: "privatetx", "Hashed effective private state for validator: {:?}", private_state_hash);
+					let password = find_account_password(&self.passwords, &*self.accounts, &validator_account);
+					let signed_state = self.accounts.sign(validator_account, password, private_state_hash);
+					if let Err(e) = signed_state {
+						bail!("Cannot sign the state: {:?}", e);
+					}
+					let signed_state = signed_state.expect("Error was checked before");
+					let signed_private_transaction = SignedPrivateTransaction::new(private_hash, signed_state, None);
+					trace!(target: "privatetx", "Sending signature for private transaction: {:?}", signed_private_transaction);
+					self.broadcast_signed_private_transaction(signed_private_transaction.hash(), signed_private_transaction.rlp_bytes());
 				}
 			}
 			Ok(())
@@ -326,7 +326,7 @@ impl Provider where {
 			let mut signatures = desc.received_signatures.clone();
 			signatures.push(signed_tx.signature());
 			let rsv: Vec<Signature> = signatures.into_iter().map(|sign| sign.into_electrum().into()).collect();
-			//Create public transaction
+			// Create public transaction
 			let public_tx = self.public_transaction(
 				desc.state.clone(),
 				&desc.original_transaction,
@@ -335,7 +335,7 @@ impl Provider where {
 				desc.original_transaction.gas_price
 			)?;
 			trace!(target: "privatetx", "Last required signature received, public transaction created: {:?}", public_tx);
-			//Sign and add it to the queue
+			// Sign and add it to the queue
 			let chain_id = desc.original_transaction.chain_id();
 			let hash = public_tx.hash(chain_id);
 			let signer_account = self.signer_account.ok_or_else(|| ErrorKind::SignerAccountNotSet)?;
@@ -349,13 +349,22 @@ impl Provider where {
 					bail!(err);
 				}
 			}
-			//Remove from store for signing
+			// Notify about state changes
+			let contract = Self::contract_address_from_transaction(&desc.original_transaction)?;
+			// TODO #9825 Usage of BlockId::Latest
+			if self.get_contract_version(BlockId::Latest, &contract) >= PRIVATE_CONTRACT_WITH_NOTIFICATION_VER {
+				match self.state_changes_notify(BlockId::Latest, &contract, &desc.original_transaction.sender(), desc.original_transaction.hash()) {
+					Ok(_) => trace!(target: "privatetx", "Notification about private state changes sent"),
+					Err(err) => warn!(target: "privatetx", "Failed to send private state changed notification, error: {:?}", err),
+				}
+			}
+			// Remove from store for signing
 			if let Err(err) = self.transactions_for_signing.write().remove(&private_hash) {
 				warn!(target: "privatetx", "Failed to remove transaction from signing store, error: {:?}", err);
 				bail!(err);
 			}
 		} else {
-			//Add signature to the store
+			// Add signature to the store
 			match self.transactions_for_signing.write().add_signature(&private_hash, signed_tx.signature()) {
 				Ok(_) => trace!(target: "privatetx", "Signature stored for private transaction"),
 				Err(err) => {
@@ -366,6 +375,16 @@ impl Provider where {
 		}
 		Ok(())
  	}
+
+	fn contract_address_from_transaction(transaction: &SignedTransaction) -> Result<Address, Error> {
+		match transaction.action {
+			Action::Call(contract) => Ok(contract),
+			_ => {
+				warn!(target: "privatetx", "Incorrect type of action for the transaction");
+				bail!(ErrorKind::BadTransactonType);
+			}
+		}
+	}
 
 	fn last_required_signature(&self, desc: &PrivateTransactionSigningDesc, sign: Signature) -> Result<bool, Error>  {
 		if desc.received_signatures.contains(&sign) {
@@ -425,31 +444,23 @@ impl Provider where {
 	}
 
 	fn get_decrypted_state(&self, address: &Address, block: BlockId) -> Result<Bytes, Error> {
-		let contract = private::PrivateContract::default();
-		let state = contract.functions()
-			.state()
-			.call(&|data| self.client.call_contract(block, *address, data))
-			.map_err(|e| ErrorKind::Call(format!("Contract call failed {:?}", e)))?;
-
+		let (data, decoder) = private_contract::functions::state::call();
+		let value = self.client.call_contract(block, *address, data)?;
+		let state = decoder.decode(&value).map_err(|e| ErrorKind::Call(format!("Contract call failed {:?}", e)))?;
 		self.decrypt(address, &state)
 	}
 
 	fn get_decrypted_code(&self, address: &Address, block: BlockId) -> Result<Bytes, Error> {
-		let contract = private::PrivateContract::default();
-		let code = contract.functions()
-			.code()
-			.call(&|data| self.client.call_contract(block, *address, data))
-			.map_err(|e| ErrorKind::Call(format!("Contract call failed {:?}", e)))?;
-
-		self.decrypt(address, &code)
+		let (data, decoder) = private_contract::functions::code::call();
+		let value = self.client.call_contract(block, *address, data)?;
+		let state = decoder.decode(&value).map_err(|e| ErrorKind::Call(format!("Contract call failed {:?}", e)))?;
+		self.decrypt(address, &state)
 	}
 
 	pub fn get_contract_nonce(&self, address: &Address, block: BlockId) -> Result<U256, Error> {
-		let contract = private::PrivateContract::default();
-		Ok(contract.functions()
-			.nonce()
-			.call(&|data| self.client.call_contract(block, *address, data))
-			.map_err(|e| ErrorKind::Call(format!("Contract call failed {:?}", e)))?)
+		let (data, decoder) = private_contract::functions::nonce::call();
+		let value = self.client.call_contract(block, *address, data)?;
+		decoder.decode(&value).map_err(|e| ErrorKind::Call(format!("Contract call failed {:?}", e)).into())
 	}
 
 	fn snapshot_to_storage(raw: Bytes) -> HashMap<H256, H256> {
@@ -464,7 +475,9 @@ impl Provider where {
 
 	fn snapshot_from_storage(storage: &HashMap<H256, H256>) -> Bytes {
 		let mut raw = Vec::with_capacity(storage.len() * 64);
-		for (key, value) in storage {
+		// Sort the storage to guarantee the order for all parties
+		let sorted_storage: BTreeMap<&H256, &H256> = storage.iter().collect();
+		for (key, value) in sorted_storage {
 			raw.extend_from_slice(key);
 			raw.extend_from_slice(value);
 		};
@@ -480,7 +493,7 @@ impl Provider where {
 		env_info.gas_limit = transaction.gas;
 
 		let mut state = self.client.state_at(block).ok_or(ErrorKind::StatePruned)?;
-		// TODO: in case of BlockId::Latest these need to operate on the same state
+		// TODO #9825 in case of BlockId::Latest these need to operate on the same state
 		let contract_address = match transaction.action {
 			Action::Call(ref contract_address) => {
 				let contract_code = Arc::new(self.get_decrypted_code(contract_address, block)?);
@@ -506,6 +519,7 @@ impl Provider where {
 			None => bail!(ErrorKind::ContractDoesNotExist),
 			Some(address) => {
 				let (code, storage) = state.into_account(&address)?;
+				trace!(target: "privatetx", "Private contract executed. code: {:?}, state: {:?}, result: {:?}", code, storage, result.output);
 				let enc_code = match code {
 					Some(c) => Some(self.encrypt(&address, &Self::iv_from_address(&address), &c)?),
 					None => None,
@@ -513,7 +527,6 @@ impl Provider where {
 				(enc_code, self.encrypt(&address, &Self::iv_from_transaction(transaction), &Self::snapshot_from_storage(&storage))?)
 			},
 		};
-		trace!(target: "privatetx", "Private contract executed. code: {:?}, state: {:?}, result: {:?}", encrypted_code, encrypted_storage, result.output);
 		Ok(PrivateExecutionResult {
 			code: encrypted_code,
 			state: encrypted_storage,
@@ -524,13 +537,11 @@ impl Provider where {
 
 	fn generate_constructor(validators: &[Address], code: Bytes, storage: Bytes) -> Bytes {
 		let constructor_code = DEFAULT_STUB_CONTRACT.from_hex().expect("Default contract code is valid");
-		let private = private::PrivateContract::default();
-		private.constructor(constructor_code, validators.iter().map(|a| *a).collect::<Vec<Address>>(), code, storage)
+		private_contract::constructor(constructor_code, validators.iter().map(|a| *a).collect::<Vec<Address>>(), code, storage)
 	}
 
 	fn generate_set_state_call(signatures: &[Signature], storage: Bytes) -> Bytes {
-		let private = private::PrivateContract::default();
-		private.functions().set_state().input(
+		private_contract::functions::set_state::encode_input(
 			storage,
 			signatures.iter().map(|s| {
 				let mut v: [u8; 32] = [0; 32];
@@ -544,7 +555,7 @@ impl Provider where {
 
 	/// Returns the key from the key server associated with the contract
 	pub fn contract_key_id(&self, contract_address: &Address) -> Result<H256, Error> {
-		//current solution uses contract address extended with 0 as id
+		// Current solution uses contract address extended with 0 as id
 		let contract_address_extended: H256 = contract_address.into();
 
 		Ok(H256::from_slice(&contract_address_extended))
@@ -559,19 +570,34 @@ impl Provider where {
 		let state = self.client.state_at(block).ok_or(ErrorKind::StatePruned)?;
 		let nonce = state.nonce(&sender)?;
 		let executed = self.execute_private(source, TransactOptions::with_no_tracing(), block)?;
-		let gas: u64 = 650000 +
-			validators.len() as u64 * 30000 +
-			executed.code.as_ref().map_or(0, |c| c.len() as u64) * 8000 +
-			executed.state.len() as u64 * 8000;
-		Ok((Transaction {
+		let header = self.client.block_header(block)
+			.ok_or(ErrorKind::StatePruned)
+			.and_then(|h| h.decode().map_err(|_| ErrorKind::StateIncorrect).into())?;
+		let (executed_code, executed_state) = (executed.code.unwrap_or_default(), executed.state);
+		let tx_data = Self::generate_constructor(validators, executed_code.clone(), executed_state.clone());
+		let mut tx = Transaction {
 			nonce: nonce,
 			action: Action::Create,
-			gas: gas.into(),
+			gas: u64::max_value().into(),
 			gas_price: gas_price,
 			value: source.value,
-			data: Self::generate_constructor(validators, executed.code.unwrap_or_default(), executed.state)
-		},
-		executed.contract_address))
+			data: tx_data,
+		};
+		tx.gas = match self.client.estimate_gas(&tx.clone().fake_sign(sender), &state, &header) {
+			Ok(estimated_gas) => estimated_gas,
+			Err(_) => self.estimate_tx_gas(validators, &executed_code, &executed_state, &[]),
+		};
+
+		Ok((tx, executed.contract_address))
+	}
+
+	fn estimate_tx_gas(&self, validators: &[Address], code: &Bytes, state: &Bytes, signatures: &[Signature]) -> U256 {
+		let default_gas = 650000 +
+			validators.len() as u64 * 30000 +
+			code.len() as u64 * 8000 +
+			signatures.len() as u64 * 50000 +
+			state.len() as u64 * 8000;
+		default_gas.into()
 	}
 
 	/// Create encrypted public contract deployment transaction. Returns updated encrypted state.
@@ -585,7 +611,7 @@ impl Provider where {
 
 	/// Create encrypted public transaction from private transaction.
 	pub fn public_transaction(&self, state: Bytes, source: &SignedTransaction, signatures: &[Signature], nonce: U256, gas_price: U256) -> Result<Transaction, Error> {
-		let gas: u64 = 650000 + state.len() as u64 * 8000 + signatures.len() as u64 * 50000;
+		let gas = self.estimate_tx_gas(&[], &Vec::new(), &state, signatures);
 		Ok(Transaction {
 			nonce: nonce,
 			action: source.action.clone(),
@@ -604,11 +630,24 @@ impl Provider where {
 
 	/// Returns private validators for a contract.
 	pub fn get_validators(&self, block: BlockId, address: &Address) -> Result<Vec<Address>, Error> {
-		let contract = private::PrivateContract::default();
-		Ok(contract.functions()
-			.get_validators()
-			.call(&|data| self.client.call_contract(block, *address, data))
-			.map_err(|e| ErrorKind::Call(format!("Contract call failed {:?}", e)))?)
+		let (data, decoder) = private_contract::functions::get_validators::call();
+		let value = self.client.call_contract(block, *address, data)?;
+		decoder.decode(&value).map_err(|e| ErrorKind::Call(format!("Contract call failed {:?}", e)).into())
+	}
+
+	fn get_contract_version(&self, block: BlockId, address: &Address) -> usize {
+		let (data, decoder) = private_contract::functions::get_version::call();
+		match self.client.call_contract(block, *address, data)
+			.and_then(|value| decoder.decode(&value).map_err(|e| e.to_string())) {
+			Ok(version) => version.low_u64() as usize,
+			Err(_) => INITIAL_PRIVATE_CONTRACT_VER,
+		}
+	}
+
+	fn state_changes_notify(&self, block: BlockId, address: &Address, originator: &Address, transaction_hash: H256) -> Result<(), Error> {
+		let (data, _) = private_contract::functions::notify_changes::call(*originator, transaction_hash.0.to_vec());
+		let _value = self.client.call_contract(block, *address, data)?;
+		Ok(())
 	}
 }
 
@@ -639,12 +678,12 @@ impl Importer for Arc<Provider> {
 			.iter()
 			.find(|address| self.validator_accounts.contains(address));
 
-		//extract the original transaction
+		// Extract the original transaction
 		let encrypted_data = private_tx.encrypted();
 		let transaction_bytes = self.decrypt(&contract, &encrypted_data)?;
 		let original_tx: UnverifiedTransaction = Rlp::new(&transaction_bytes).as_val()?;
 		let nonce_cache = NonceCache::new(NONCE_CACHE_SIZE);
-		//add to the queue for further verification
+		// Add to the queue for further verification
 		self.transactions_for_verification.add_transaction(
 			original_tx,
 			validation_account.map(|&account| account),
@@ -695,12 +734,11 @@ fn find_account_password(passwords: &Vec<Password>, account_provider: &AccountPr
 }
 
 impl ChainNotify for Provider {
-	fn new_blocks(&self, imported: Vec<H256>, _invalid: Vec<H256>, _route: ChainRoute, _sealed: Vec<H256>, _proposed: Vec<Bytes>, _duration: Duration) {
-		if !imported.is_empty() {
-			trace!(target: "privatetx", "New blocks imported, try to prune the queue");
-			if let Err(err) = self.process_verification_queue() {
-				warn!(target: "privatetx", "Cannot prune private transactions queue. error: {:?}", err);
-			}
+	fn new_blocks(&self, new_blocks: NewBlocks) {
+		if new_blocks.imported.is_empty() || new_blocks.has_more_blocks_to_import { return }
+		trace!(target: "privatetx", "New blocks imported, try to prune the queue");
+		if let Err(err) = self.process_verification_queue() {
+			warn!(target: "privatetx", "Cannot prune private transactions queue. error: {:?}", err);
 		}
 	}
 }
