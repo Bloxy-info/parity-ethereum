@@ -1,34 +1,37 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::path::Path;
 use std::cmp;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
-use hash::{KECCAK_EMPTY_LIST_RLP};
-use engines::block_reward::{self, BlockRewardContract, RewardKind};
-use ethash::{self, quick_get_difficulty, slow_hash_block_number, EthashManager, OptimizeFor};
-use ethereum_types::{H256, H64, U256, Address};
-use unexpected::{OutOfBounds, Mismatch};
-use block::*;
-use error::{BlockError, Error};
-use header::{Header, BlockNumber, ExtendedHeader};
-use engines::{self, Engine};
+
+use ethereum_types::{H256, H64, U256};
 use ethjson;
+use hash::{KECCAK_EMPTY_LIST_RLP};
 use rlp::Rlp;
+use types::header::{Header, ExtendedHeader};
+use types::BlockNumber;
+use unexpected::{OutOfBounds, Mismatch};
+
+use block::ExecutedBlock;
+use engines::block_reward::{self, BlockRewardContract, RewardKind};
+use engines::{self, Engine};
+use error::{BlockError, Error};
+use ethash::{self, quick_get_difficulty, slow_hash_block_number, EthashManager, OptimizeFor};
 use machine::EthereumMachine;
 
 /// Number of blocks in an ethash snapshot.
@@ -98,18 +101,6 @@ pub struct EthashParams {
 	pub ecip1010_continue_transition: u64,
 	/// Total block number for one ECIP-1017 era.
 	pub ecip1017_era_rounds: u64,
-	/// Number of first block where MCIP-3 begins.
-	pub mcip3_transition: u64,
-	/// MCIP-3 Block reward coin-base for miners.
-	pub mcip3_miner_reward: U256,
-	/// MCIP-3 Block reward ubi-base for basic income.
-	pub mcip3_ubi_reward: U256,
-	/// MCIP-3 contract address for universal basic income.
-	pub mcip3_ubi_contract: Address,
-	/// MCIP-3 Block reward dev-base for dev funds.
-	pub mcip3_dev_reward: U256,
-	/// MCIP-3 contract address for the developer funds.
-	pub mcip3_dev_contract: Address,
 	/// Block reward in base units.
 	pub block_reward: BTreeMap<BlockNumber, U256>,
 	/// EXPIP-2 block height
@@ -140,12 +131,6 @@ impl From<ethjson::spec::EthashParams> for EthashParams {
 			ecip1010_pause_transition: p.ecip1010_pause_transition.map_or(u64::max_value(), Into::into),
 			ecip1010_continue_transition: p.ecip1010_continue_transition.map_or(u64::max_value(), Into::into),
 			ecip1017_era_rounds: p.ecip1017_era_rounds.map_or(u64::max_value(), Into::into),
-			mcip3_transition: p.mcip3_transition.map_or(u64::max_value(), Into::into),
-			mcip3_miner_reward: p.mcip3_miner_reward.map_or_else(Default::default, Into::into),
-			mcip3_ubi_reward: p.mcip3_ubi_reward.map_or(U256::from(0), Into::into),
-			mcip3_ubi_contract: p.mcip3_ubi_contract.map_or_else(Address::new, Into::into),
-			mcip3_dev_reward: p.mcip3_dev_reward.map_or(U256::from(0), Into::into),
-			mcip3_dev_contract: p.mcip3_dev_contract.map_or_else(Address::new, Into::into),
 			block_reward: p.block_reward.map_or_else(
 				|| {
 					let mut ret = BTreeMap::new();
@@ -240,6 +225,8 @@ impl Engine<EthereumMachine> for Arc<Ethash> {
 
 	fn maximum_uncle_count(&self, _block: BlockNumber) -> usize { 2 }
 
+	fn maximum_gas_limit(&self) -> Option<U256> { Some(0x7fff_ffff_ffff_ffffu64.into()) }
+
 	fn populate_from_parent(&self, header: &mut Header, parent: &Header) {
 		let difficulty = self.calculate_difficulty(header, parent);
 		header.set_difficulty(difficulty);
@@ -287,21 +274,7 @@ impl Engine<EthereumMachine> for Arc<Ethash> {
 				// Bestow block rewards.
 				let mut result_block_reward = reward + reward.shr(5) * U256::from(n_uncles);
 
-				if number >= self.ethash_params.mcip3_transition {
-					result_block_reward = self.ethash_params.mcip3_miner_reward;
-
-					let ubi_contract = self.ethash_params.mcip3_ubi_contract;
-					let ubi_reward = self.ethash_params.mcip3_ubi_reward;
-					let dev_contract = self.ethash_params.mcip3_dev_contract;
-					let dev_reward = self.ethash_params.mcip3_dev_reward;
-
-					rewards.push((author, RewardKind::Author, result_block_reward));
-					rewards.push((ubi_contract, RewardKind::External, ubi_reward));
-					rewards.push((dev_contract, RewardKind::External, dev_reward));
-
-				} else {
-					rewards.push((author, RewardKind::Author, result_block_reward));
-				}
+				rewards.push((author, RewardKind::Author, result_block_reward));
 
 				// Bestow uncle rewards.
 				for u in LiveBlock::uncles(&*block) {
@@ -352,10 +325,6 @@ impl Engine<EthereumMachine> for Arc<Ethash> {
 
 		if &difficulty < header.difficulty() {
 			return Err(From::from(BlockError::InvalidProofOfWork(OutOfBounds { min: Some(header.difficulty().clone()), max: None, found: difficulty })));
-		}
-
-		if header.gas_limit() > &0x7fffffffffffffffu64.into() {
-			return Err(From::from(BlockError::InvalidGasLimit(OutOfBounds { min: None, max: Some(0x7fffffffffffffffu64.into()), found: header.gas_limit().clone() })));
 		}
 
 		Ok(())
@@ -516,7 +485,7 @@ mod tests {
 	use block::*;
 	use test_helpers::get_temp_state_db;
 	use error::{BlockError, Error, ErrorKind};
-	use header::Header;
+	use types::header::Header;
 	use spec::Spec;
 	use engines::Engine;
 	use super::super::{new_morden, new_mcip3_test, new_homestead_test_machine};
@@ -549,12 +518,6 @@ mod tests {
 			ecip1010_pause_transition: u64::max_value(),
 			ecip1010_continue_transition: u64::max_value(),
 			ecip1017_era_rounds: u64::max_value(),
-			mcip3_transition: u64::max_value(),
-			mcip3_miner_reward: 0.into(),
-			mcip3_ubi_reward: 0.into(),
-			mcip3_ubi_contract: "0000000000000000000000000000000000000001".into(),
-			mcip3_dev_reward: 0.into(),
-			mcip3_dev_contract: "0000000000000000000000000000000000000001".into(),
 			expip2_transition: u64::max_value(),
 			expip2_duration_limit: 30,
 			block_reward_contract: None,

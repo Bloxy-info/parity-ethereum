@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Consensus engine specification and basic implementations.
 
@@ -21,35 +21,33 @@ mod basic_authority;
 mod instant_seal;
 mod null_engine;
 mod signer;
-mod tendermint;
-mod transition;
 mod validator_set;
-mod vote_collector;
 
 pub mod block_reward;
-pub mod epoch;
 
 pub use self::authority_round::AuthorityRound;
 pub use self::basic_authority::BasicAuthority;
 pub use self::epoch::{EpochVerifier, Transition as EpochTransition};
 pub use self::instant_seal::{InstantSeal, InstantSealParams};
 pub use self::null_engine::NullEngine;
-pub use self::tendermint::Tendermint;
+
+// TODO [ToDr] Remove re-export (#10130)
+pub use types::engines::ForkChoice;
+pub use types::engines::epoch;
 
 use std::sync::{Weak, Arc};
 use std::collections::{BTreeMap, HashMap};
 use std::{fmt, error};
 
-use self::epoch::PendingTransition;
-
 use account_provider::AccountProvider;
 use builtin::Builtin;
 use vm::{EnvInfo, Schedule, CreateContractAddress, CallType, ActionValue};
 use error::Error;
-use header::{Header, BlockNumber};
+use types::BlockNumber;
+use types::header::Header;
 use snapshot::SnapshotComponents;
 use spec::CommonParams;
-use transaction::{self, UnverifiedTransaction, SignedTransaction};
+use types::transaction::{self, UnverifiedTransaction, SignedTransaction};
 
 use ethkey::{Password, Signature};
 use parity_machine::{Machine, LocalizedMachine as Localized, TotalScoredHeader};
@@ -61,15 +59,6 @@ use types::ancestry_action::AncestryAction;
 /// Default EIP-210 contract code.
 /// As defined in https://github.com/ethereum/EIPs/pull/210
 pub const DEFAULT_BLOCKHASH_CONTRACT: &'static str = "73fffffffffffffffffffffffffffffffffffffffe33141561006a5760014303600035610100820755610100810715156100455760003561010061010083050761010001555b6201000081071515610064576000356101006201000083050761020001555b5061013e565b4360003512151561008457600060405260206040f361013d565b61010060003543031315156100a857610100600035075460605260206060f361013c565b6101006000350715156100c55762010000600035430313156100c8565b60005b156100ea576101006101006000350507610100015460805260206080f361013b565b620100006000350715156101095763010000006000354303131561010c565b60005b1561012f57610100620100006000350507610200015460a052602060a0f361013a565b600060c052602060c0f35b5b5b5b5b";
-
-/// Fork choice.
-#[derive(Debug, PartialEq, Eq)]
-pub enum ForkChoice {
-	/// Choose the new block.
-	New,
-	/// Choose the current best block.
-	Old,
-}
 
 /// Voting errors.
 #[derive(Debug)]
@@ -92,6 +81,8 @@ pub enum EngineError {
 	MalformedMessage(String),
 	/// Requires client ref, but none registered.
 	RequiresClient,
+	/// Invalid engine specification or implementation.
+	InvalidEngine,
 }
 
 impl fmt::Display for EngineError {
@@ -107,6 +98,7 @@ impl fmt::Display for EngineError {
 			FailedSystemCall(ref msg) => format!("Failed to make system call: {}", msg),
 			MalformedMessage(ref msg) => format!("Received malformed consensus message: {}", msg),
 			RequiresClient => format!("Call requires client but none registered"),
+			InvalidEngine => format!("Invalid engine specification or implementation"),
 		};
 
 		f.write_fmt(format_args!("Engine error ({})", msg))
@@ -179,7 +171,7 @@ pub fn default_system_or_code_call<'a>(machine: &'a ::machine::EthereumMachine, 
 pub type Headers<'a, H> = Fn(H256) -> Option<H> + 'a;
 
 /// Type alias for a function we can query pending transitions by block hash through.
-pub type PendingTransitionStore<'a> = Fn(H256) -> Option<PendingTransition> + 'a;
+pub type PendingTransitionStore<'a> = Fn(H256) -> Option<epoch::PendingTransition> + 'a;
 
 /// Proof dependent on state.
 pub trait StateDependentProof<M: Machine>: Send + Sync {
@@ -253,6 +245,9 @@ pub trait Engine<M: Machine>: Sync + Send {
 
 	/// The number of generations back that uncles can be.
 	fn maximum_uncle_age(&self) -> usize { 6 }
+
+	/// Optional maximum gas limit.
+	fn maximum_gas_limit(&self) -> Option<U256> { None }
 
 	/// Block transformation functions, before the transactions.
 	/// `epoch_begin` set to true if this block kicks off an epoch.
@@ -335,10 +330,30 @@ pub trait Engine<M: Machine>: Sync + Send {
 	///
 	/// This either means that an immediate transition occurs or a block signalling transition
 	/// has reached finality. The `Headers` given are not guaranteed to return any blocks
-	/// from any epoch other than the current.
+	/// from any epoch other than the current. The client must keep track of finality and provide
+	/// the latest finalized headers to check against the transition store.
 	///
 	/// Return optional transition proof.
 	fn is_epoch_end(
+		&self,
+		_chain_head: &M::Header,
+		_finalized: &[H256],
+		_chain: &Headers<M::Header>,
+		_transition_store: &PendingTransitionStore,
+	) -> Option<Vec<u8>> {
+		None
+	}
+
+	/// Whether a block is the end of an epoch.
+	///
+	/// This either means that an immediate transition occurs or a block signalling transition
+	/// has reached finality. The `Headers` given are not guaranteed to return any blocks
+	/// from any epoch other than the current. This is a specialized method to use for light
+	/// clients since the light client doesn't track finality of all blocks, and therefore finality
+	/// for blocks in the current epoch is built inside this method by the engine.
+	///
+	/// Return optional transition proof.
+	fn is_epoch_end_light(
 		&self,
 		_chain_head: &M::Header,
 		_chain: &Headers<M::Header>,
@@ -406,7 +421,7 @@ pub trait Engine<M: Machine>: Sync + Send {
 
 	/// Gather all ancestry actions. Called at the last stage when a block is committed. The Engine must guarantee that
 	/// the ancestry exists.
-	fn ancestry_actions(&self, _block: &M::LiveBlock, _ancestry: &mut Iterator<Item=M::ExtendedHeader>) -> Vec<AncestryAction> {
+	fn ancestry_actions(&self, _header: &M::Header, _ancestry: &mut Iterator<Item=M::ExtendedHeader>) -> Vec<AncestryAction> {
 		Vec::new()
 	}
 
