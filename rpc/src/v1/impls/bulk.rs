@@ -20,7 +20,8 @@ use std::sync::Arc;
 
 use ethcore::client::{BlockChainClient, BlockId, TransactionId, StateClient, StateInfo, Call, EngineInfo};
 use ethcore::miner::{self, MinerService};
-use ethcore::encoded;
+
+use types::encoded;
 
 use jsonrpc_core::{BoxFuture, Result};
 use jsonrpc_core::futures::future;
