@@ -1,24 +1,26 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
-use ethcore::log_entry::{LocalizedLogEntry, LogEntry};
-use v1::types::{Bytes, H160, H256, U256};
+use ethereum_types::{H160, H256, U256};
+use types::log_entry::{LocalizedLogEntry, LogEntry};
+use v1::types::Bytes;
 
 /// Log
 #[derive(Debug, Serialize, PartialEq, Eq, Hash, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Log {
 	/// H160
 	pub address: H160,
@@ -27,25 +29,19 @@ pub struct Log {
 	/// Data
 	pub data: Bytes,
 	/// Block Hash
-	#[serde(rename="blockHash")]
 	pub block_hash: Option<H256>,
 	/// Block Number
-	#[serde(rename="blockNumber")]
 	pub block_number: Option<U256>,
 	/// Transaction Hash
-	#[serde(rename="transactionHash")]
 	pub transaction_hash: Option<H256>,
 	/// Transaction Index
-	#[serde(rename="transactionIndex")]
 	pub transaction_index: Option<U256>,
 	/// Log Index in Block
-	#[serde(rename="logIndex")]
 	pub log_index: Option<U256>,
 	/// Log Index in Transaction
-	#[serde(rename="transactionLogIndex")]
 	pub transaction_log_index: Option<U256>,
 	/// Log Type
-	#[serde(rename="type")]
+	#[serde(rename = "type")]
 	pub log_type: String,
 	/// Whether Log Type is Removed (Geth Compatibility Field)
 	#[serde(default)]
@@ -55,12 +51,12 @@ pub struct Log {
 impl From<LocalizedLogEntry> for Log {
 	fn from(e: LocalizedLogEntry) -> Log {
 		Log {
-			address: e.entry.address.into(),
+			address: e.entry.address,
 			topics: e.entry.topics.into_iter().map(Into::into).collect(),
 			data: e.entry.data.into(),
-			block_hash: Some(e.block_hash.into()),
+			block_hash: Some(e.block_hash),
 			block_number: Some(e.block_number.into()),
-			transaction_hash: Some(e.transaction_hash.into()),
+			transaction_hash: Some(e.transaction_hash),
 			transaction_index: Some(e.transaction_index.into()),
 			log_index: Some(e.log_index.into()),
 			transaction_log_index: Some(e.transaction_log_index.into()),
@@ -73,7 +69,7 @@ impl From<LocalizedLogEntry> for Log {
 impl From<LogEntry> for Log {
 	fn from(e: LogEntry) -> Log {
 		Log {
-			address: e.address.into(),
+			address: e.address,
 			topics: e.topics.into_iter().map(Into::into).collect(),
 			data: e.data.into(),
 			block_hash: None,
@@ -92,7 +88,8 @@ impl From<LogEntry> for Log {
 mod tests {
 	use serde_json;
 	use std::str::FromStr;
-	use v1::types::{Log, H160, H256, U256};
+	use v1::types::Log;
+	use ethereum_types::{H160, H256, U256};
 
 	#[test]
 	fn log_serialization() {

@@ -1,24 +1,24 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Snapshot-related errors.
 
 use std::fmt;
 
-use ids::BlockId;
+use types::ids::BlockId;
 
 use ethereum_types::H256;
 use ethtrie::TrieError;
@@ -61,10 +61,14 @@ pub enum Error {
 	ChunkTooLarge,
 	/// Snapshots not supported by the consensus engine.
 	SnapshotsUnsupported,
+	/// Aborted snapshot
+	SnapshotAborted,
 	/// Bad epoch transition.
 	BadEpochProof(u64),
 	/// Wrong chunk format.
 	WrongChunkFormat(String),
+	/// Unlinked ancient block chain
+	UnlinkedAncientBlockChain,
 }
 
 impl fmt::Display for Error {
@@ -89,8 +93,10 @@ impl fmt::Display for Error {
 			Error::ChunkTooSmall => write!(f, "Chunk size is too small."),
 			Error::ChunkTooLarge => write!(f, "Chunk size is too large."),
 			Error::SnapshotsUnsupported => write!(f, "Snapshots unsupported by consensus engine."),
+			Error::SnapshotAborted => write!(f, "Snapshot was aborted."),
 			Error::BadEpochProof(i) => write!(f, "Bad epoch proof for transition to epoch {}", i),
 			Error::WrongChunkFormat(ref msg) => write!(f, "Wrong chunk format: {}", msg),
+			Error::UnlinkedAncientBlockChain => write!(f, "Unlinked ancient blocks chain"),
 		}
 	}
 }

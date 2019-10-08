@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::net::{SocketAddr, SocketAddrV4, Ipv4Addr};
 use std::collections::{HashMap, HashSet};
@@ -42,10 +42,12 @@ use network::{NetworkConfiguration, NetworkIoMessage, ProtocolId, PeerId, Packet
 use network::{NonReservedPeerMode, NetworkContext as NetworkContextTrait};
 use network::{SessionInfo, Error, ErrorKind, DisconnectReason, NetworkProtocolHandler};
 use discovery::{Discovery, TableUpdates, NodeEntry, MAX_DATAGRAM_SIZE};
+use network::client_version::ClientVersion;
 use ip_utils::{map_external_address, select_public_address};
 use parity_path::restrict_permissions_owner;
 use parking_lot::{Mutex, RwLock};
 use network::{ConnectionFilter, ConnectionDirection};
+use connection::PAYLOAD_SOFT_LIMIT;
 
 type Slab<T> = ::slab::Slab<T, usize>;
 
@@ -179,8 +181,8 @@ impl<'s> NetworkContextTrait for NetworkContext<'s> {
 		Ok(())
 	}
 
-	fn peer_client_version(&self, peer: PeerId) -> String {
-		self.resolve_session(peer).map_or("unknown".to_owned(), |s| s.lock().info.client_version.clone())
+	fn peer_client_version(&self, peer: PeerId) -> ClientVersion {
+		self.resolve_session(peer).map_or(ClientVersion::from("unknown").to_owned(), |s| s.lock().info.client_version.clone())
 	}
 
 	fn session_info(&self, peer: PeerId) -> Option<SessionInfo> {
@@ -199,6 +201,10 @@ impl<'s> NetworkContextTrait for NetworkContext<'s> {
 			.and_then(|info| info.id)
 			.map(|node| self.reserved_peers.contains(&node))
 			.unwrap_or(false)
+	}
+
+	fn payload_soft_limit(&self) -> usize {
+		PAYLOAD_SOFT_LIMIT
 	}
 }
 
@@ -248,6 +254,8 @@ struct ProtocolTimer {
 }
 
 /// Root IO handler. Manages protocol handlers, IO timers and network connections.
+///
+/// NOTE: must keep the lock in order of: reserved_nodes (rwlock) -> session (mutex, from sessions)
 pub struct Host {
 	pub info: RwLock<HostInfo>,
 	udp_socket: Mutex<Option<UdpSocket>>,
@@ -709,12 +717,13 @@ impl Host {
 					let session_result = session.lock().readable(io, &self.info.read());
 					match session_result {
 						Err(e) => {
+							let reserved_nodes = self.reserved_nodes.read();
 							let s = session.lock();
 							trace!(target: "network", "Session read error: {}:{:?} ({:?}) {:?}", token, s.id(), s.remote_addr(), e);
 							match *e.kind() {
 								ErrorKind::Disconnect(DisconnectReason::IncompatibleProtocol) | ErrorKind::Disconnect(DisconnectReason::UselessPeer) => {
 									if let Some(id) = s.id() {
-										if !self.reserved_nodes.read().contains(id) {
+										if !reserved_nodes.contains(id) {
 											let mut nodes = self.nodes.write();
 											nodes.note_failure(&id);
 											nodes.mark_as_useless(id);
@@ -728,6 +737,7 @@ impl Host {
 						},
 						Ok(SessionData::Ready) => {
 							let (_, egress_count, ingress_count) = self.session_count();
+							let reserved_nodes = self.reserved_nodes.read();
 							let mut s = session.lock();
 							let (min_peers, mut max_peers, reserved_only, self_id) = {
 								let info = self.info.read();
@@ -752,7 +762,7 @@ impl Host {
 							if reserved_only ||
 								(s.info.originated && egress_count > min_peers) ||
 								(!s.info.originated && ingress_count > max_ingress) {
-								if !self.reserved_nodes.read().contains(&id) {
+								if !reserved_nodes.contains(&id) {
 									// only proceed if the connecting peer is reserved.
 									trace!(target: "network", "Disconnecting non-reserved peer {:?}", id);
 									s.disconnect(io, DisconnectReason::TooManyPeers);
@@ -967,7 +977,8 @@ impl Host {
 		for i in to_remove {
 			trace!(target: "network", "Removed from node table: {}", i);
 		}
-		self.nodes.write().update(node_changes, &*self.reserved_nodes.read());
+		let reserved_nodes = self.reserved_nodes.read();
+		self.nodes.write().update(node_changes, &*reserved_nodes);
 	}
 
 	pub fn with_context<F>(&self, protocol: ProtocolId, io: &IoContext<NetworkIoMessage>, action: F) where F: FnOnce(&NetworkContextTrait) {
@@ -1053,8 +1064,9 @@ impl IoHandler<NetworkIoMessage> for Host {
 			},
 			NODE_TABLE => {
 				trace!(target: "network", "Refreshing node table");
-				self.nodes.write().clear_useless();
-				self.nodes.write().save();
+				let mut nodes = self.nodes.write();
+				nodes.clear_useless();
+				nodes.save();
 			},
 			_ => match self.timers.read().get(&token).cloned() {
 				Some(timer) => match self.handlers.read().get(&timer.protocol).cloned() {

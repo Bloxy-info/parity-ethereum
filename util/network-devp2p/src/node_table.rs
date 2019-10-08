@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 use discovery::{TableUpdates, NodeEntry};
 use ethereum_types::H512;
@@ -103,10 +103,16 @@ impl NodeEndpoint {
 		self.to_rlp(rlp);
 	}
 
-	/// Validates that the port is not 0 and address IP is specified
-	pub fn is_valid(&self) -> bool {
-		self.udp_port != 0 && self.address.port() != 0 &&
-		match self.address {
+	/// Validates that the tcp port is not 0 and that the node is a valid discovery node (i.e. `is_valid_discovery_node()` is true).
+	/// Sync happens over tcp.
+	pub fn is_valid_sync_node(&self) -> bool {
+		self.is_valid_discovery_node() && self.address.port() != 0
+	}
+
+	/// Validates that the udp port is not 0 and address IP is specified.
+	/// Peer discovery happens over udp.
+	pub fn is_valid_discovery_node(&self) -> bool {
+		self.udp_port != 0 && match self.address {
 			SocketAddr::V4(a) => !a.ip().is_unspecified(),
 			SocketAddr::V6(a) => !a.ip().is_unspecified()
 		}

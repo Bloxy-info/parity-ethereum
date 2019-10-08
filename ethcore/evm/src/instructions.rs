@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! VM Instructions list and utility functions
 
@@ -45,7 +45,7 @@ macro_rules! enum_with_from_u8 {
 enum_with_from_u8! {
 	#[doc = "Virtual machine bytecode instruction."]
 	#[repr(u8)]
-	#[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Copy, Debug)]
+	#[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Copy, Debug, Hash)]
 	pub enum Instruction {
 		#[doc = "halts execution"]
 		STOP = 0x00,
@@ -149,6 +149,10 @@ enum_with_from_u8! {
 		DIFFICULTY = 0x44,
 		#[doc = "get the block's gas limit"]
 		GASLIMIT = 0x45,
+		#[doc = "get chain ID"]
+		CHAINID = 0x46,
+		#[doc = "get balance of own account"]
+		SELFBALANCE = 0x47,
 
 		#[doc = "remove item from stack"]
 		POP = 0x50,
@@ -354,7 +358,6 @@ impl Instruction {
 		}
 	}
 
-
 	/// Returns stack position of item to duplicate
 	/// DUP1 -> 0
 	pub fn dup_position(&self) -> Option<usize> {
@@ -364,7 +367,6 @@ impl Instruction {
 			None
 		}
 	}
-
 
 	/// Returns stack position of item to SWAP top with
 	/// SWAP1 -> 1
@@ -444,12 +446,7 @@ pub struct InstructionInfo {
 impl InstructionInfo {
 	/// Create new instruction info.
 	pub fn new(name: &'static str, args: usize, ret: usize, tier: GasPriceTier) -> Self {
-		InstructionInfo {
-			name: name,
-			args: args,
-			ret: ret,
-			tier: tier
-		}
+		InstructionInfo { name, args, ret, tier }
 	}
 }
 
@@ -506,6 +503,8 @@ lazy_static! {
 		arr[NUMBER as usize] = Some(InstructionInfo::new("NUMBER", 0, 1, GasPriceTier::Base));
 		arr[DIFFICULTY as usize] = Some(InstructionInfo::new("DIFFICULTY", 0, 1, GasPriceTier::Base));
 		arr[GASLIMIT as usize] = Some(InstructionInfo::new("GASLIMIT", 0, 1, GasPriceTier::Base));
+		arr[CHAINID as usize] = Some(InstructionInfo::new("CHAINID", 0, 1, GasPriceTier::Base));
+		arr[SELFBALANCE as usize] = Some(InstructionInfo::new("SELFBALANCE", 0, 1, GasPriceTier::Low));
 		arr[POP as usize] = Some(InstructionInfo::new("POP", 1, 0, GasPriceTier::Base));
 		arr[MLOAD as usize] = Some(InstructionInfo::new("MLOAD", 1, 1, GasPriceTier::VeryLow));
 		arr[MSTORE as usize] = Some(InstructionInfo::new("MSTORE", 2, 0, GasPriceTier::VeryLow));

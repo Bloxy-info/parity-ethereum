@@ -1,21 +1,21 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 use ethereum_types::U256;
-use transaction::{self, PendingTransaction};
+use types::transaction::{self, PendingTransaction};
 use txpool;
 
 use pool::{verifier, TransactionQueue, PrioritizationStrategy, PendingSettings, PendingOrdering};
@@ -30,7 +30,7 @@ use self::client::TestClient;
 // to the global use allocator, the value is currently
 // set to reflect malloc usage.
 // 50 was enough when using jmalloc.
-const TEST_QUEUE_MAX_MEM: usize = 80;
+const TEST_QUEUE_MAX_MEM: usize = 100;
 
 fn new_queue() -> TransactionQueue {
 	TransactionQueue::new(
@@ -91,13 +91,13 @@ fn should_return_correct_nonces_when_dropped_because_of_limit() {
 	// then
 	assert_eq!(res, vec![Ok(()), Ok(())]);
 	assert_eq!(res2, vec![
-			   // The error here indicates reaching the limit
-			   // and minimal effective gas price taken into account.
-			   Err(transaction::Error::InsufficientGasPrice { minimal: 2.into(), got: 1.into() }),
-			   Ok(())
+		// The error here indicates reaching the limit
+		// and minimal effective gas price taken into account.
+		Err(transaction::Error::TooCheapToReplace { prev: Some(2.into()), new: Some(1.into()) }),
+		Ok(())
 	]);
 	assert_eq!(txq.status().status.transaction_count, 3);
-	// tx2 transacton got dropped because of limit
+	// tx2 transaction got dropped because of limit
 	// tx1 and tx1' are kept, because they have lower insertion_ids so they are preferred.
 	assert_eq!(txq.next_nonce(TestClient::new(), &sender), None);
 }
@@ -585,7 +585,7 @@ fn should_not_replace_same_transaction_if_the_fee_is_less_than_minimal_bump() {
 	let res = txq.import(client.clone(), vec![tx2, tx4].local());
 
 	// then
-	assert_eq!(res, vec![Err(transaction::Error::TooCheapToReplace), Ok(())]);
+	assert_eq!(res, vec![Err(transaction::Error::TooCheapToReplace { prev: None, new: None }), Ok(())]);
 	assert_eq!(txq.status().status.transaction_count, 2);
 	assert_eq!(txq.pending(client.clone(), PendingSettings::all_prioritized(0, 0))[0].signed().gas_price, U256::from(20));
 	assert_eq!(txq.pending(client.clone(), PendingSettings::all_prioritized(0, 0))[1].signed().gas_price, U256::from(2));
@@ -1027,16 +1027,15 @@ fn should_reject_early_in_case_gas_price_is_less_than_min_effective() {
 	let client = TestClient::new();
 	let tx1 = Tx::default().signed().unverified();
 	let res = txq.import(client.clone(), vec![tx1]);
-	assert_eq!(res, vec![Err(transaction::Error::InsufficientGasPrice {
-		minimal: 2.into(),
-		got: 1.into(),
+	assert_eq!(res, vec![Err(transaction::Error::TooCheapToReplace {
+		prev: Some(2.into()),
+		new: Some(1.into()),
 	})]);
 	assert!(!client.was_verification_triggered());
 
 	// then
 	assert_eq!(txq.status().status.transaction_count, 1);
 }
-
 
 #[test]
 fn should_not_reject_early_in_case_gas_price_is_less_than_min_effective() {

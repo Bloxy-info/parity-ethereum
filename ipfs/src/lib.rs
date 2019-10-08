@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 extern crate multihash;
 extern crate cid;
@@ -22,7 +22,7 @@ extern crate rlp;
 extern crate ethcore;
 extern crate parity_bytes as bytes;
 extern crate ethereum_types;
-extern crate jsonrpc_core as core;
+extern crate jsonrpc_core;
 extern crate jsonrpc_http_server as http;
 
 pub mod error;
@@ -32,13 +32,12 @@ use std::thread;
 use std::sync::{mpsc, Arc};
 use std::net::{SocketAddr, IpAddr};
 
-use core::futures::future::{self, FutureResult};
-use core::futures::{self, Future};
+use jsonrpc_core::futures::future::{self, FutureResult};
+use jsonrpc_core::futures::{self, Future};
 use ethcore::client::BlockChainClient;
-use http::hyper::header::{self, Vary, ContentType};
-use http::hyper::{Method, StatusCode};
-use http::hyper::{self, server};
-use unicase::Ascii;
+use http::hyper::{self, server, Method, StatusCode, Body,
+	header::{self, HeaderValue},
+};
 
 use error::ServerError;
 use route::Out;
@@ -52,24 +51,24 @@ pub struct IpfsHandler {
 	/// Hostnames allowed in the `Host` request header
 	allowed_hosts: Option<Vec<Host>>,
 	/// Reference to the Blockchain Client
-	client: Arc<BlockChainClient>,
+	client: Arc<dyn BlockChainClient>,
 }
 
 impl IpfsHandler {
-	pub fn client(&self) -> &BlockChainClient {
+	pub fn client(&self) -> &dyn BlockChainClient {
 		&*self.client
 	}
 
-	pub fn new(cors: DomainsValidation<AccessControlAllowOrigin>, hosts: DomainsValidation<Host>, client: Arc<BlockChainClient>) -> Self {
+	pub fn new(cors: DomainsValidation<AccessControlAllowOrigin>, hosts: DomainsValidation<Host>, client: Arc<dyn BlockChainClient>) -> Self {
 		IpfsHandler {
 			cors_domains: cors.into(),
 			allowed_hosts: hosts.into(),
-			client: client,
+			client,
 		}
 	}
-	pub fn on_request(&self, req: hyper::Request) -> (Option<header::AccessControlAllowOrigin>, Out) {
+	pub fn on_request(&self, req: hyper::Request<Body>) -> (Option<HeaderValue>, Out) {
 		match *req.method() {
-			Method::Get | Method::Post => {},
+			Method::GET | Method::POST => {},
 			_ => return (None, Out::Bad("Invalid Request")),
 		}
 
@@ -77,8 +76,8 @@ impl IpfsHandler {
 			return (None, Out::Bad("Disallowed Host header"));
 		}
 
-		let cors_header = http::cors_header(&req, &self.cors_domains);
-		if cors_header == http::CorsHeader::Invalid {
+		let cors_header = http::cors_allow_origin(&req, &self.cors_domains);
+		if cors_header == http::AllowCors::Invalid {
 			return (None, Out::Bad("Disallowed Origin header"));
 		}
 
@@ -88,39 +87,39 @@ impl IpfsHandler {
 	}
 }
 
-impl server::Service for IpfsHandler {
-	type Request = hyper::Request;
-	type Response = hyper::Response;
+impl hyper::service::Service for IpfsHandler {
+	type ReqBody = Body;
+	type ResBody = Body;
 	type Error = hyper::Error;
-	type Future = FutureResult<hyper::Response, hyper::Error>;
+	type Future = FutureResult<hyper::Response<Body>, Self::Error>;
 
-	fn call(&self, request: Self::Request) -> Self::Future {
+	fn call(&mut self, request: hyper::Request<Self::ReqBody>) -> Self::Future {
 		let (cors_header, out) = self.on_request(request);
 
 		let mut res = match out {
 			Out::OctetStream(bytes) => {
-				hyper::Response::new()
-					.with_status(StatusCode::Ok)
-					.with_header(ContentType::octet_stream())
-					.with_body(bytes)
+				hyper::Response::builder()
+					.status(StatusCode::OK)
+					.header("content-type", HeaderValue::from_static("application/octet-stream"))
+					.body(bytes.into())
 			},
 			Out::NotFound(reason) => {
-				hyper::Response::new()
-					.with_status(StatusCode::NotFound)
-					.with_header(ContentType::plaintext())
-					.with_body(reason)
+				hyper::Response::builder()
+					.status(StatusCode::NOT_FOUND)
+					.header("content-type", HeaderValue::from_static("text/plain; charset=utf-8"))
+					.body(reason.into())
 			},
 			Out::Bad(reason) => {
-				hyper::Response::new()
-					.with_status(StatusCode::BadRequest)
-					.with_header(ContentType::plaintext())
-					.with_body(reason)
+				hyper::Response::builder()
+					.status(StatusCode::BAD_REQUEST)
+					.header("content-type", HeaderValue::from_static("text/plain; charset=utf-8"))
+					.body(reason.into())
 			}
-		};
+		}.expect("Response builder: Parsing 'content-type' header name will not fail; qed");
 
 		if let Some(cors_header) = cors_header {
-			res.headers_mut().set(cors_header);
-			res.headers_mut().set(Vary::Items(vec![Ascii::new("Origin".into())]));
+			res.headers_mut().append(header::ACCESS_CONTROL_ALLOW_ORIGIN, cors_header);
+			res.headers_mut().append(header::VARY, HeaderValue::from_static("origin"));
 		}
 
 		future::ok(res)
@@ -155,7 +154,7 @@ pub fn start_server(
 	interface: String,
 	cors: DomainsValidation<AccessControlAllowOrigin>,
 	hosts: DomainsValidation<Host>,
-	client: Arc<BlockChainClient>
+	client: Arc<dyn BlockChainClient>
 ) -> Result<Listening, ServerError> {
 
 	let ip: IpAddr = interface.parse().map_err(|_| ServerError::InvalidInterface)?;
@@ -164,23 +163,32 @@ pub fn start_server(
 	let hosts: DomainsValidation<_> = hosts.map(move |hosts| include_current_interface(hosts, interface, port)).into();
 
 	let (close, shutdown_signal) = futures::sync::oneshot::channel::<()>();
-	let (tx, rx) = mpsc::sync_channel(1);
+	let (tx, rx) = mpsc::sync_channel::<Result<(), ServerError>>(1);
 	let thread = thread::spawn(move || {
 		let send = |res| tx.send(res).expect("rx end is never dropped; qed");
-		let server = match server::Http::new().bind(&addr, move || {
-			Ok(IpfsHandler::new(cors.clone(), hosts.clone(), client.clone()))
-		}) {
-			Ok(server) => {
-				send(Ok(()));
-				server
-			},
+
+		let server_bldr = match server::Server::try_bind(&addr) {
+			Ok(s) => s,
 			Err(err) => {
-				send(Err(err));
+				send(Err(ServerError::from(err)));
 				return;
 			}
 		};
 
-		let _ = server.run_until(shutdown_signal.map_err(|_| {}));
+		let new_service = move || {
+			Ok::<_, ServerError>(
+				IpfsHandler::new(cors.clone(), hosts.clone(), client.clone())
+			)
+		};
+
+		let server = server_bldr
+			.serve(new_service)
+			.map_err(|_| ())
+			.select(shutdown_signal.map_err(|_| ()))
+			.then(|_| Ok(()));
+
+		hyper::rt::run(server);
+		send(Ok(()));
 	});
 
 	// Wait for server to start successfuly.

@@ -1,4 +1,5 @@
 [package]
+description = "Parity WASM Test Run"
 name = "pwasm-run-test"
 version = "0.1.0"
 authors = ["Parity Technologies <admin@parity.io>"]
@@ -12,7 +13,7 @@ ethjson = { path = "../../../json" }
 vm = { path = "../../vm" }
 wasm = { path = "../" }
 clap = "2.24"
-ethcore-logger = { path = "../../../logger" }
+env_logger = "0.5"
 rustc-hex = "1"
 
 [features]

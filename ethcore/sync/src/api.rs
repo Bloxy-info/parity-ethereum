@@ -1,45 +1,46 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::sync::Arc;
+use std::sync::{Arc, mpsc, atomic};
 use std::collections::{HashMap, BTreeMap};
 use std::io;
-use std::ops::Range;
+use std::ops::RangeInclusive;
 use std::time::Duration;
 use bytes::Bytes;
 use devp2p::NetworkService;
 use network::{NetworkProtocolHandler, NetworkContext, PeerId, ProtocolId,
 	NetworkConfiguration as BasicNetworkConfiguration, NonReservedPeerMode, Error, ErrorKind,
 	ConnectionFilter};
+use network::client_version::ClientVersion;
 
 use types::pruning_info::PruningInfo;
 use ethereum_types::{H256, H512, U256};
 use io::{TimerToken};
-use ethcore::ethstore::ethkey::Secret;
-use ethcore::client::{BlockChainClient, ChainNotify, ChainRoute, ChainMessageType};
+use ethkey::Secret;
+use ethcore::client::{BlockChainClient, ChainNotify, NewBlocks, ChainMessageType};
 use ethcore::snapshot::SnapshotService;
-use ethcore::header::BlockNumber;
+use types::BlockNumber;
 use sync_io::NetSyncIo;
-use chain::{ChainSync, SyncStatus as EthSyncStatus};
+use chain::{ChainSyncApi, SyncStatus as EthSyncStatus};
 use std::net::{SocketAddr, AddrParseError};
 use std::str::FromStr;
-use parking_lot::RwLock;
+use parking_lot::{RwLock, Mutex};
 use chain::{ETH_PROTOCOL_VERSION_63, ETH_PROTOCOL_VERSION_62,
-	PAR_PROTOCOL_VERSION_1, PAR_PROTOCOL_VERSION_2, PAR_PROTOCOL_VERSION_3,
-	PRIVATE_TRANSACTION_PACKET, SIGNED_PRIVATE_TRANSACTION_PACKET};
+	PAR_PROTOCOL_VERSION_1, PAR_PROTOCOL_VERSION_2, PAR_PROTOCOL_VERSION_3};
+use chain::sync_packet::SyncPacket::{PrivateTransactionPacket, SignedPrivateTransactionPacket};
 use light::client::AsLightClient;
 use light::Provider;
 use light::net::{
@@ -48,7 +49,9 @@ use light::net::{
 };
 use network::IpFilter;
 use private_tx::PrivateTxHandler;
-use transaction::UnverifiedTransaction;
+use types::transaction::UnverifiedTransaction;
+
+use super::light_sync::SyncInfo;
 
 /// Parity sync protocol
 pub const WARP_SYNC_PROTOCOL_ID: ProtocolId = *b"par";
@@ -158,7 +161,7 @@ pub struct PeerInfo {
 	/// Public node id
 	pub id: Option<String>,
 	/// Node client ID
-	pub client_version: String,
+	pub client_version: ClientVersion,
 	/// Capabilities
 	pub capabilities: Vec<String>,
 	/// Remote endpoint address
@@ -228,6 +231,37 @@ impl AttachedProtocol {
 	}
 }
 
+/// A prioritized tasks run in a specialised timer.
+/// Every task should be completed within a hard deadline,
+/// if it's not it's either cancelled or split into multiple tasks.
+/// NOTE These tasks might not complete at all, so anything
+/// that happens here should work even if the task is cancelled.
+#[derive(Debug)]
+pub enum PriorityTask {
+	/// Propagate given block
+	PropagateBlock {
+		/// When the task was initiated
+		started: ::std::time::Instant,
+		/// Raw block RLP to propagate
+		block: Bytes,
+		/// Block hash
+		hash: H256,
+		/// Blocks difficulty
+		difficulty: U256,
+	},
+	/// Propagate a list of transactions
+	PropagateTransactions(::std::time::Instant, Arc<atomic::AtomicBool>),
+}
+impl PriorityTask {
+	/// Mark the task as being processed, right after it's retrieved from the queue.
+	pub fn starting(&self) {
+		match *self {
+			PriorityTask::PropagateTransactions(_, ref is_ready) => is_ready.store(true, atomic::Ordering::SeqCst),
+			_ => {},
+		}
+	}
+}
+
 /// EthSync initialization parameters.
 pub struct Params {
 	/// Configuration.
@@ -237,7 +271,7 @@ pub struct Params {
 	/// Snapshot service.
 	pub snapshot_service: Arc<SnapshotService>,
 	/// Private tx service.
-	pub private_tx_handler: Arc<PrivateTxHandler>,
+	pub private_tx_handler: Option<Arc<PrivateTxHandler>>,
 	/// Light data provider.
 	pub provider: Arc<::light::Provider>,
 	/// Network layer configuration.
@@ -260,6 +294,8 @@ pub struct EthSync {
 	subprotocol_name: [u8; 3],
 	/// Light subprotocol name.
 	light_subprotocol_name: [u8; 3],
+	/// Priority tasks notification channel
+	priority_tasks: Mutex<mpsc::Sender<PriorityTask>>,
 }
 
 fn light_params(
@@ -312,13 +348,19 @@ impl EthSync {
 			})
 		};
 
-		let chain_sync = ChainSync::new(params.config, &*params.chain, params.private_tx_handler.clone());
+		let (priority_tasks_tx, priority_tasks_rx) = mpsc::channel();
+		let sync = ChainSyncApi::new(
+			params.config,
+			&*params.chain,
+			params.private_tx_handler.as_ref().cloned(),
+			priority_tasks_rx,
+		);
 		let service = NetworkService::new(params.network_config.clone().into_basic()?, connection_filter)?;
 
 		let sync = Arc::new(EthSync {
 			network: service,
 			eth_handler: Arc::new(SyncProtocolHandler {
-				sync: RwLock::new(chain_sync),
+				sync,
 				chain: params.chain,
 				snapshot_service: params.snapshot_service,
 				overlay: RwLock::new(HashMap::new()),
@@ -327,26 +369,32 @@ impl EthSync {
 			subprotocol_name: params.config.subprotocol_name,
 			light_subprotocol_name: params.config.light_subprotocol_name,
 			attached_protos: params.attached_protos,
+			priority_tasks: Mutex::new(priority_tasks_tx),
 		});
 
 		Ok(sync)
+	}
+
+	/// Priority tasks producer
+	pub fn priority_tasks(&self) -> mpsc::Sender<PriorityTask> {
+		self.priority_tasks.lock().clone()
 	}
 }
 
 impl SyncProvider for EthSync {
 	/// Get sync status
 	fn status(&self) -> EthSyncStatus {
-		self.eth_handler.sync.read().status()
+		self.eth_handler.sync.status()
 	}
 
 	/// Get sync peers
 	fn peers(&self) -> Vec<PeerInfo> {
 		self.network.with_context_eval(self.subprotocol_name, |ctx| {
 			let peer_ids = self.network.connected_peers();
-			let eth_sync = self.eth_handler.sync.read();
 			let light_proto = self.light_proto.as_ref();
 
-			peer_ids.into_iter().filter_map(|peer_id| {
+			let peer_info = self.eth_handler.sync.peer_info(&peer_ids);
+			peer_ids.into_iter().zip(peer_info).filter_map(|(peer_id, peer_info)| {
 				let session_info = match ctx.session_info(peer_id) {
 					None => return None,
 					Some(info) => info,
@@ -358,7 +406,7 @@ impl SyncProvider for EthSync {
 					capabilities: session_info.peer_capabilities.into_iter().map(|c| c.to_string()).collect(),
 					remote_address: session_info.remote_address,
 					local_address: session_info.local_address,
-					eth_info: eth_sync.peer_info(&peer_id),
+					eth_info: peer_info,
 					pip_info: light_proto.as_ref().and_then(|lp| lp.peer_status(peer_id)).map(Into::into),
 				})
 			}).collect()
@@ -370,17 +418,17 @@ impl SyncProvider for EthSync {
 	}
 
 	fn transactions_stats(&self) -> BTreeMap<H256, TransactionStats> {
-		let sync = self.eth_handler.sync.read();
-		sync.transactions_stats()
-			.iter()
-			.map(|(hash, stats)| (*hash, stats.into()))
-			.collect()
+		self.eth_handler.sync.transactions_stats()
 	}
 }
 
 const PEERS_TIMER: TimerToken = 0;
-const SYNC_TIMER: TimerToken = 1;
-const TX_TIMER: TimerToken = 2;
+const MAINTAIN_SYNC_TIMER: TimerToken = 1;
+const CONTINUE_SYNC_TIMER: TimerToken = 2;
+const TX_TIMER: TimerToken = 3;
+const PRIORITY_TIMER: TimerToken = 4;
+
+pub(crate) const PRIORITY_TIMER_INTERVAL: Duration = Duration::from_millis(250);
 
 struct SyncProtocolHandler {
 	/// Shared blockchain client.
@@ -388,7 +436,7 @@ struct SyncProtocolHandler {
 	/// Shared snapshot service.
 	snapshot_service: Arc<SnapshotService>,
 	/// Sync strategy
-	sync: RwLock<ChainSync>,
+	sync: ChainSyncApi,
 	/// Chain overlay used to cache data such as fork block.
 	overlay: RwLock<HashMap<BlockNumber, Bytes>>,
 }
@@ -397,13 +445,16 @@ impl NetworkProtocolHandler for SyncProtocolHandler {
 	fn initialize(&self, io: &NetworkContext) {
 		if io.subprotocol_name() != WARP_SYNC_PROTOCOL_ID {
 			io.register_timer(PEERS_TIMER, Duration::from_millis(700)).expect("Error registering peers timer");
-			io.register_timer(SYNC_TIMER, Duration::from_millis(1100)).expect("Error registering sync timer");
+			io.register_timer(MAINTAIN_SYNC_TIMER, Duration::from_millis(1100)).expect("Error registering sync timer");
+			io.register_timer(CONTINUE_SYNC_TIMER, Duration::from_millis(2500)).expect("Error registering sync timer");
 			io.register_timer(TX_TIMER, Duration::from_millis(1300)).expect("Error registering transactions timer");
+
+			io.register_timer(PRIORITY_TIMER, PRIORITY_TIMER_INTERVAL).expect("Error registering peers timer");
 		}
 	}
 
 	fn read(&self, io: &NetworkContext, peer: &PeerId, packet_id: u8, data: &[u8]) {
-		ChainSync::dispatch_packet(&self.sync, &mut NetSyncIo::new(io, &*self.chain, &*self.snapshot_service, &self.overlay), *peer, packet_id, data);
+		self.sync.dispatch_packet(&mut NetSyncIo::new(io, &*self.chain, &*self.snapshot_service, &self.overlay), *peer, packet_id, data);
 	}
 
 	fn connected(&self, io: &NetworkContext, peer: &PeerId) {
@@ -428,24 +479,31 @@ impl NetworkProtocolHandler for SyncProtocolHandler {
 		let mut io = NetSyncIo::new(io, &*self.chain, &*self.snapshot_service, &self.overlay);
 		match timer {
 			PEERS_TIMER => self.sync.write().maintain_peers(&mut io),
-			SYNC_TIMER => self.sync.write().maintain_sync(&mut io),
-			TX_TIMER => {
-				self.sync.write().propagate_new_transactions(&mut io);
-			},
+			MAINTAIN_SYNC_TIMER => self.sync.write().maintain_sync(&mut io),
+			CONTINUE_SYNC_TIMER => self.sync.write().continue_sync(&mut io),
+			TX_TIMER => self.sync.write().propagate_new_transactions(&mut io),
+			PRIORITY_TIMER => self.sync.process_priority_queue(&mut io),
 			_ => warn!("Unknown timer {} triggered.", timer),
 		}
 	}
 }
 
 impl ChainNotify for EthSync {
-	fn new_blocks(&self,
-		imported: Vec<H256>,
-		invalid: Vec<H256>,
-		route: ChainRoute,
-		sealed: Vec<H256>,
-		proposed: Vec<Bytes>,
-		_duration: Duration)
+	fn block_pre_import(&self, bytes: &Bytes, hash: &H256, difficulty: &U256) {
+		let task = PriorityTask::PropagateBlock {
+			started: ::std::time::Instant::now(),
+			block: bytes.clone(),
+			hash: *hash,
+			difficulty: *difficulty,
+		};
+		if let Err(e) = self.priority_tasks.lock().send(task) {
+			warn!(target: "sync", "Unexpected error during priority block propagation: {:?}", e);
+		}
+	}
+
+	fn new_blocks(&self, new_blocks: NewBlocks)
 	{
+		if new_blocks.has_more_blocks_to_import { return }
 		use light::net::Announcement;
 
 		self.network.with_context(self.subprotocol_name, |context| {
@@ -453,12 +511,12 @@ impl ChainNotify for EthSync {
 				&self.eth_handler.overlay);
 			self.eth_handler.sync.write().chain_new_blocks(
 				&mut sync_io,
-				&imported,
-				&invalid,
-				route.enacted(),
-				route.retracted(),
-				&sealed,
-				&proposed);
+				&new_blocks.imported,
+				&new_blocks.invalid,
+				new_blocks.route.enacted(),
+				new_blocks.route.retracted(),
+				&new_blocks.sealed,
+				&new_blocks.proposed);
 		});
 
 		self.network.with_context(self.light_subprotocol_name, |context| {
@@ -521,9 +579,9 @@ impl ChainNotify for EthSync {
 			match message_type {
 				ChainMessageType::Consensus(message) => self.eth_handler.sync.write().propagate_consensus_packet(&mut sync_io, message),
 				ChainMessageType::PrivateTransaction(transaction_hash, message) =>
-					self.eth_handler.sync.write().propagate_private_transaction(&mut sync_io, transaction_hash, PRIVATE_TRANSACTION_PACKET, message),
+					self.eth_handler.sync.write().propagate_private_transaction(&mut sync_io, transaction_hash, PrivateTransactionPacket, message),
 				ChainMessageType::SignedPrivateTransaction(transaction_hash, message) =>
-					self.eth_handler.sync.write().propagate_private_transaction(&mut sync_io, transaction_hash, SIGNED_PRIVATE_TRANSACTION_PACKET, message),
+					self.eth_handler.sync.write().propagate_private_transaction(&mut sync_io, transaction_hash, SignedPrivateTransactionPacket, message),
 			}
 		});
 	}
@@ -539,7 +597,7 @@ impl ChainNotify for EthSync {
 struct TxRelay(Arc<BlockChainClient>);
 
 impl LightHandler for TxRelay {
-	fn on_transactions(&self, ctx: &EventContext, relay: &[::transaction::UnverifiedTransaction]) {
+	fn on_transactions(&self, ctx: &EventContext, relay: &[::types::transaction::UnverifiedTransaction]) {
 		trace!(target: "pip", "Relaying {} transactions from peer {}", relay.len(), ctx.peer());
 		self.0.queue_transactions(relay.iter().map(|tx| ::rlp::encode(tx)).collect(), ctx.peer())
 	}
@@ -560,9 +618,7 @@ pub trait ManageNetwork : Send + Sync {
 	/// Stop network
 	fn stop_network(&self);
 	/// Returns the minimum and maximum peers.
-	/// Note that `range.end` is *exclusive*.
-	// TODO: Range should be changed to RangeInclusive once stable (https://github.com/rust-lang/rust/pull/50758)
-	fn num_peers_range(&self) -> Range<u32>;
+	fn num_peers_range(&self) -> RangeInclusive<u32>;
 	/// Get network context for protocol.
 	fn with_proto_context(&self, proto: ProtocolId, f: &mut FnMut(&NetworkContext));
 }
@@ -601,7 +657,7 @@ impl ManageNetwork for EthSync {
 		self.stop();
 	}
 
-	fn num_peers_range(&self) -> Range<u32> {
+	fn num_peers_range(&self) -> RangeInclusive<u32> {
 		self.network.num_peers_range()
 	}
 
@@ -750,6 +806,24 @@ pub trait LightSyncProvider {
 	fn transactions_stats(&self) -> BTreeMap<H256, TransactionStats>;
 }
 
+/// Wrapper around `light_sync::SyncInfo` to expose those methods without the concrete type `LightSync`
+pub trait LightSyncInfo: Send + Sync {
+	/// Get the highest block advertised on the network.
+	fn highest_block(&self) -> Option<u64>;
+
+	/// Get the block number at the time of sync start.
+	fn start_block(&self) -> u64;
+
+	/// Whether major sync is underway.
+	fn is_major_importing(&self) -> bool;
+}
+
+/// Execute a closure with a protocol context.
+pub trait LightNetworkDispatcher {
+	/// Execute a closure with a protocol context.
+	fn with_context<F, T>(&self, f: F) -> Option<T> where F: FnOnce(&::light::net::BasicContext) -> T;
+}
+
 /// Configuration for the light sync.
 pub struct LightSyncParams<L> {
 	/// Network configuration.
@@ -769,7 +843,7 @@ pub struct LightSyncParams<L> {
 /// Service for light synchronization.
 pub struct LightSync {
 	proto: Arc<LightProtocol>,
-	sync: Arc<::light_sync::SyncInfo + Sync + Send>,
+	sync: Arc<SyncInfo + Sync + Send>,
 	attached_protos: Vec<AttachedProtocol>,
 	network: NetworkService,
 	subprotocol_name: [u8; 3],
@@ -820,21 +894,22 @@ impl LightSync {
 		})
 	}
 
-	/// Execute a closure with a protocol context.
-	pub fn with_context<F, T>(&self, f: F) -> Option<T>
-		where F: FnOnce(&::light::net::BasicContext) -> T
-	{
-		self.network.with_context_eval(
-			self.subprotocol_name,
-			move |ctx| self.proto.with_context(&ctx, f),
-		)
-	}
 }
 
 impl ::std::ops::Deref for LightSync {
 	type Target = ::light_sync::SyncInfo;
 
 	fn deref(&self) -> &Self::Target { &*self.sync }
+}
+
+
+impl LightNetworkDispatcher for LightSync {
+	fn with_context<F, T>(&self, f: F) -> Option<T> where F: FnOnce(&::light::net::BasicContext) -> T {
+		self.network.with_context_eval(
+			self.subprotocol_name,
+			move |ctx| self.proto.with_context(&ctx, f),
+		)
+	}
 }
 
 impl ManageNetwork for LightSync {
@@ -880,7 +955,7 @@ impl ManageNetwork for LightSync {
 		self.network.stop();
 	}
 
-	fn num_peers_range(&self) -> Range<u32> {
+	fn num_peers_range(&self) -> RangeInclusive<u32> {
 		self.network.num_peers_range()
 	}
 
@@ -893,12 +968,12 @@ impl LightSyncProvider for LightSync {
 	fn peer_numbers(&self) -> PeerNumbers {
 		let (connected, active) = self.proto.peer_count();
 		let peers_range = self.num_peers_range();
-		debug_assert!(peers_range.end > peers_range.start);
+		debug_assert!(peers_range.end() >= peers_range.start());
 		PeerNumbers {
 			connected: connected,
 			active: active,
-			max: peers_range.end as usize - 1,
-			min: peers_range.start as usize,
+			max: *peers_range.end() as usize,
+			min: *peers_range.start() as usize,
 		}
 	}
 
@@ -935,5 +1010,19 @@ impl LightSyncProvider for LightSync {
 
 	fn transactions_stats(&self) -> BTreeMap<H256, TransactionStats> {
 		Default::default() // TODO
+	}
+}
+
+impl LightSyncInfo for LightSync {
+	fn highest_block(&self) -> Option<u64> {
+		(*self.sync).highest_block()
+	}
+
+	fn start_block(&self) -> u64 {
+		(*self.sync).start_block()
+	}
+
+	fn is_major_importing(&self) -> bool {
+		(*self.sync).is_major_importing()
 	}
 }

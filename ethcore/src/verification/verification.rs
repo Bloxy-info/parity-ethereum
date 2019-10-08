@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Block and transaction verification functions
 //!
@@ -32,12 +32,15 @@ use triehash::ordered_trie_root;
 use unexpected::{Mismatch, OutOfBounds};
 
 use blockchain::*;
-use client::{BlockInfo, CallContract};
-use engines::EthEngine;
+use call_contract::CallContract;
+use client::BlockInfo;
+use engines::{EthEngine, MAX_UNCLE_AGE};
 use error::{BlockError, Error};
-use header::{BlockNumber, Header};
-use transaction::SignedTransaction;
+use types::{BlockNumber, header::Header};
+use types::transaction::SignedTransaction;
 use verification::queue::kind::blocks::Unverified;
+
+use time_utils::CheckedSystemTime;
 
 /// Preprocessed block data gathered in `verify_block_unordered` call
 pub struct PreverifiedBlock {
@@ -61,7 +64,7 @@ impl HeapSizeOf for PreverifiedBlock {
 
 /// Phase 1 quick block verification. Only does checks that are cheap. Operates on a single block
 pub fn verify_block_basic(block: &Unverified, engine: &EthEngine, check_seal: bool) -> Result<(), Error> {
-	verify_header_params(&block.header, engine, true)?;
+	verify_header_params(&block.header, engine, true, check_seal)?;
 	verify_block_integrity(block)?;
 
 	if check_seal {
@@ -69,7 +72,7 @@ pub fn verify_block_basic(block: &Unverified, engine: &EthEngine, check_seal: bo
 	}
 
 	for uncle in &block.uncles {
-		verify_header_params(uncle, engine, false)?;
+		verify_header_params(uncle, engine, false, check_seal)?;
 		if check_seal {
 			engine.verify_block_basic(uncle)?;
 		}
@@ -172,10 +175,10 @@ fn verify_uncles(block: &PreverifiedBlock, bc: &BlockProvider, engine: &EthEngin
 		excluded.insert(header.hash());
 		let mut hash = header.parent_hash().clone();
 		excluded.insert(hash.clone());
-		for _ in 0..engine.maximum_uncle_age() {
+		for _ in 0..MAX_UNCLE_AGE {
 			match bc.block_details(&hash) {
 				Some(details) => {
-					excluded.insert(details.parent.clone());
+					excluded.insert(details.parent);
 					let b = bc.block(&hash)
 						.expect("parent already known to be stored; qed");
 					excluded.extend(b.uncle_hashes());
@@ -205,7 +208,7 @@ fn verify_uncles(block: &PreverifiedBlock, bc: &BlockProvider, engine: &EthEngin
 			//												(8 Invalid)
 
 			let depth = if header.number() > uncle.number() { header.number() - uncle.number() } else { 0 };
-			if depth > engine.maximum_uncle_age() as u64 {
+			if depth > MAX_UNCLE_AGE as u64 {
 				return Err(From::from(BlockError::UncleTooOld(OutOfBounds { min: Some(header.number() - depth), max: Some(header.number() - 1), found: uncle.number() })));
 			}
 			else if depth < 1 {
@@ -248,38 +251,45 @@ fn verify_uncles(block: &PreverifiedBlock, bc: &BlockProvider, engine: &EthEngin
 /// Phase 4 verification. Check block information against transaction enactment results,
 pub fn verify_block_final(expected: &Header, got: &Header) -> Result<(), Error> {
 	if expected.state_root() != got.state_root() {
-		return Err(From::from(BlockError::InvalidStateRoot(Mismatch { expected: expected.state_root().clone(), found: got.state_root().clone() })))
+		return Err(From::from(BlockError::InvalidStateRoot(Mismatch { expected: *expected.state_root(), found: *got.state_root() })))
 	}
 	if expected.gas_used() != got.gas_used() {
-		return Err(From::from(BlockError::InvalidGasUsed(Mismatch { expected: expected.gas_used().clone(), found: got.gas_used().clone() })))
+		return Err(From::from(BlockError::InvalidGasUsed(Mismatch { expected: *expected.gas_used(), found: *got.gas_used() })))
 	}
 	if expected.log_bloom() != got.log_bloom() {
-		return Err(From::from(BlockError::InvalidLogBloom(Mismatch { expected: expected.log_bloom().clone(), found: got.log_bloom().clone() })))
+		return Err(From::from(BlockError::InvalidLogBloom(Box::new(Mismatch { expected: *expected.log_bloom(), found: *got.log_bloom() }))))
 	}
 	if expected.receipts_root() != got.receipts_root() {
-		return Err(From::from(BlockError::InvalidReceiptsRoot(Mismatch { expected: expected.receipts_root().clone(), found: got.receipts_root().clone() })))
+		return Err(From::from(BlockError::InvalidReceiptsRoot(Mismatch { expected: *expected.receipts_root(), found: *got.receipts_root() })))
 	}
 	Ok(())
 }
 
 /// Check basic header parameters.
-pub fn verify_header_params(header: &Header, engine: &EthEngine, is_full: bool) -> Result<(), Error> {
-	let expected_seal_fields = engine.seal_fields(header);
-	if header.seal().len() != expected_seal_fields {
-		return Err(From::from(BlockError::InvalidSealArity(
-			Mismatch { expected: expected_seal_fields, found: header.seal().len() }
-		)));
+pub fn verify_header_params(header: &Header, engine: &EthEngine, is_full: bool, check_seal: bool) -> Result<(), Error> {
+	if check_seal {
+		let expected_seal_fields = engine.seal_fields(header);
+		if header.seal().len() != expected_seal_fields {
+			return Err(From::from(BlockError::InvalidSealArity(
+				Mismatch { expected: expected_seal_fields, found: header.seal().len() }
+			)));
+		}
 	}
 
 	if header.number() >= From::from(BlockNumber::max_value()) {
 		return Err(From::from(BlockError::RidiculousNumber(OutOfBounds { max: Some(From::from(BlockNumber::max_value())), min: None, found: header.number() })))
 	}
 	if header.gas_used() > header.gas_limit() {
-		return Err(From::from(BlockError::TooMuchGasUsed(OutOfBounds { max: Some(header.gas_limit().clone()), min: None, found: header.gas_used().clone() })));
+		return Err(From::from(BlockError::TooMuchGasUsed(OutOfBounds { max: Some(*header.gas_limit()), min: None, found: *header.gas_used() })));
 	}
 	let min_gas_limit = engine.params().min_gas_limit;
 	if header.gas_limit() < &min_gas_limit {
-		return Err(From::from(BlockError::InvalidGasLimit(OutOfBounds { min: Some(min_gas_limit), max: None, found: header.gas_limit().clone() })));
+		return Err(From::from(BlockError::InvalidGasLimit(OutOfBounds { min: Some(min_gas_limit), max: None, found: *header.gas_limit() })));
+	}
+	if let Some(limit) = engine.maximum_gas_limit() {
+		if header.gas_limit() > &limit {
+			return Err(From::from(::error::BlockError::InvalidGasLimit(OutOfBounds { min: None, max: Some(limit), found: *header.gas_limit() })));
+		}
 	}
 	let maximum_extra_data_size = engine.maximum_extra_data_size();
 	if header.number() != 0 && header.extra_data().len() > maximum_extra_data_size {
@@ -296,9 +306,11 @@ pub fn verify_header_params(header: &Header, engine: &EthEngine, is_full: bool) 
 
 	if is_full {
 		const ACCEPTABLE_DRIFT: Duration = Duration::from_secs(15);
+		// this will resist overflow until `year 2037`
 		let max_time = SystemTime::now() + ACCEPTABLE_DRIFT;
 		let invalid_threshold = max_time + ACCEPTABLE_DRIFT * 9;
-		let timestamp = UNIX_EPOCH + Duration::from_secs(header.timestamp());
+		let timestamp = CheckedSystemTime::checked_add(UNIX_EPOCH, Duration::from_secs(header.timestamp()))
+			.ok_or(BlockError::TimestampOverflow)?;
 
 		if timestamp > invalid_threshold {
 			return Err(From::from(BlockError::InvalidTimestamp(OutOfBounds { max: Some(max_time), min: None, found: timestamp })))
@@ -320,8 +332,11 @@ fn verify_parent(header: &Header, parent: &Header, engine: &EthEngine) -> Result
 	let gas_limit_divisor = engine.params().gas_limit_bound_divisor;
 
 	if !engine.is_timestamp_valid(header.timestamp(), parent.timestamp()) {
-		let min = SystemTime::now() + Duration::from_secs(parent.timestamp() + 1);
-		let found = SystemTime::now() + Duration::from_secs(header.timestamp());
+		let now = SystemTime::now();
+		let min = CheckedSystemTime::checked_add(now, Duration::from_secs(parent.timestamp().saturating_add(1)))
+			.ok_or(BlockError::TimestampOverflow)?;
+		let found = CheckedSystemTime::checked_add(now, Duration::from_secs(header.timestamp()))
+			.ok_or(BlockError::TimestampOverflow)?;
 		return Err(From::from(BlockError::InvalidTimestamp(OutOfBounds { max: None, min: Some(min), found })))
 	}
 	if header.number() != parent.number() + 1 {
@@ -336,7 +351,7 @@ fn verify_parent(header: &Header, parent: &Header, engine: &EthEngine) -> Result
 	let min_gas = parent_gas_limit - parent_gas_limit / gas_limit_divisor;
 	let max_gas = parent_gas_limit + parent_gas_limit / gas_limit_divisor;
 	if header.gas_limit() <= &min_gas || header.gas_limit() >= &max_gas {
-		return Err(From::from(BlockError::InvalidGasLimit(OutOfBounds { min: Some(min_gas), max: Some(max_gas), found: header.gas_limit().clone() })));
+		return Err(From::from(BlockError::InvalidGasLimit(OutOfBounds { min: Some(min_gas), max: Some(max_gas), found: *header.gas_limit() })));
 	}
 
 	Ok(())
@@ -371,7 +386,7 @@ mod tests {
 	use std::time::{SystemTime, UNIX_EPOCH};
 	use ethereum_types::{H256, BloomRef, U256};
 	use blockchain::{BlockDetails, TransactionAddress, BlockReceipts};
-	use encoded;
+	use types::encoded;
 	use hash::keccak;
 	use engines::EthEngine;
 	use error::BlockError::*;
@@ -379,7 +394,7 @@ mod tests {
 	use ethkey::{Random, Generator};
 	use spec::{CommonParams, Spec};
 	use test_helpers::{create_test_block_with_data, create_test_block};
-	use transaction::{SignedTransaction, Transaction, UnverifiedTransaction, Action};
+	use types::transaction::{SignedTransaction, Transaction, UnverifiedTransaction, Action};
 	use types::log_entry::{LogEntry, LocalizedLogEntry};
 	use rlp;
 	use triehash::ordered_trie_root;
@@ -520,7 +535,7 @@ mod tests {
 		// is fine.
 		let client = ::client::TestBlockChainClient::default();
 		let parent = bc.block_header_data(header.parent_hash())
-			.ok_or(BlockError::UnknownParent(header.parent_hash().clone()))?
+			.ok_or(BlockError::UnknownParent(*header.parent_hash()))?
 			.decode()?;
 
 		let block = PreverifiedBlock {
@@ -631,14 +646,18 @@ mod tests {
 		good_uncle1.set_parent_hash(parent8.hash());
 		good_uncle1.set_difficulty(parent8.difficulty().clone() + diff_inc);
 		good_uncle1.set_timestamp(parent8.timestamp() + 10);
-		good_uncle1.extra_data_mut().push(1u8);
+		let mut ex = good_uncle1.extra_data().to_vec();
+		ex.push(1u8);
+		good_uncle1.set_extra_data(ex);
 
 		let mut good_uncle2 = good.clone();
 		good_uncle2.set_number(8);
 		good_uncle2.set_parent_hash(parent7.hash());
 		good_uncle2.set_difficulty(parent7.difficulty().clone() + diff_inc);
 		good_uncle2.set_timestamp(parent7.timestamp() + 10);
-		good_uncle2.extra_data_mut().push(2u8);
+		let mut ex = good_uncle2.extra_data().to_vec();
+		ex.push(2u8);
+		good_uncle2.set_extra_data(ex);
 
 		let good_uncles = vec![ good_uncle1.clone(), good_uncle2.clone() ];
 		let mut uncles_rlp = RlpStream::new();
@@ -695,12 +714,16 @@ mod tests {
 			TooMuchGasUsed(OutOfBounds { max: Some(header.gas_limit().clone()), min: None, found: header.gas_used().clone() }));
 
 		header = good.clone();
-		header.extra_data_mut().resize(engine.maximum_extra_data_size() + 1, 0u8);
+		let mut ex = header.extra_data().to_vec();
+		ex.resize(engine.maximum_extra_data_size() + 1, 0u8);
+		header.set_extra_data(ex);
 		check_fail(basic_test(&create_test_block(&header), engine),
 			ExtraDataOutOfBounds(OutOfBounds { max: Some(engine.maximum_extra_data_size()), min: None, found: header.extra_data().len() }));
 
 		header = good.clone();
-		header.extra_data_mut().resize(engine.maximum_extra_data_size() + 1, 0u8);
+		let mut ex = header.extra_data().to_vec();
+		ex.resize(engine.maximum_extra_data_size() + 1, 0u8);
+		header.set_extra_data(ex);
 		check_fail(basic_test(&create_test_block(&header), engine),
 			ExtraDataOutOfBounds(OutOfBounds { max: Some(engine.maximum_extra_data_size()), min: None, found: header.extra_data().len() }));
 
@@ -727,7 +750,8 @@ mod tests {
 		check_fail_timestamp(family_test(&create_test_block_with_data(&header, &good_transactions, &good_uncles), engine, &bc), false);
 
 		header = good.clone();
-		header.set_timestamp(2450000000);
+		// will return `BlockError::TimestampOverflow` when timestamp > `i32::max_value()`
+		header.set_timestamp(i32::max_value() as u64);
 		check_fail_timestamp(basic_test(&create_test_block_with_data(&header, &good_transactions, &good_uncles), engine), false);
 
 		header = good.clone();
@@ -771,7 +795,7 @@ mod tests {
 	#[test]
 	fn dust_protection() {
 		use ethkey::{Generator, Random};
-		use transaction::{Transaction, Action};
+		use types::transaction::{Transaction, Action};
 		use machine::EthereumMachine;
 		use engines::NullEngine;
 

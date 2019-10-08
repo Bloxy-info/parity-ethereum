@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 /// Validator set maintained in a contract, updated using `getValidators` method.
 /// It can also report validators for misbehaviour with two levels: `reportMalicious` and `reportBenign`.
@@ -21,22 +21,22 @@ use std::sync::Weak;
 
 use bytes::Bytes;
 use ethereum_types::{H256, Address};
+use machine::{AuxiliaryData, Call, EthereumMachine};
 use parking_lot::RwLock;
+use types::BlockNumber;
+use types::header::Header;
 
 use client::EngineClient;
-use header::{Header, BlockNumber};
-use machine::{AuxiliaryData, Call, EthereumMachine};
 
 use super::{ValidatorSet, SimpleList, SystemCall};
 use super::safe_contract::ValidatorSafeContract;
 
-use_contract!(validator_report, "ValidatorReport", "res/contracts/validator_report.json");
+use_contract!(validator_report, "res/contracts/validator_report.json");
 
 /// A validator contract with reporting.
 pub struct ValidatorContract {
 	contract_address: Address,
 	validators: ValidatorSafeContract,
-	provider: validator_report::ValidatorReport,
 	client: RwLock<Option<Weak<EngineClient>>>, // TODO [keorn]: remove
 }
 
@@ -45,7 +45,6 @@ impl ValidatorContract {
 		ValidatorContract {
 			contract_address,
 			validators: ValidatorSafeContract::new(contract_address),
-			provider: validator_report::ValidatorReport::default(),
 			client: RwLock::new(None),
 		}
 	}
@@ -69,7 +68,7 @@ impl ValidatorContract {
 }
 
 impl ValidatorSet for ValidatorContract {
-	fn default_caller(&self, id: ::ids::BlockId) -> Box<Call> {
+	fn default_caller(&self, id: ::types::ids::BlockId) -> Box<Call> {
 		self.validators.default_caller(id)
 	}
 
@@ -111,7 +110,7 @@ impl ValidatorSet for ValidatorContract {
 	}
 
 	fn report_malicious(&self, address: &Address, _set_block: BlockNumber, block: BlockNumber, proof: Bytes) {
-		let data = self.provider.functions().report_malicious().input(*address, block, proof);
+		let data = validator_report::functions::report_malicious::encode_input(*address, block, proof);
 		match self.transact(data) {
 			Ok(_) => warn!(target: "engine", "Reported malicious validator {}", address),
 			Err(s) => warn!(target: "engine", "Validator {} could not be reported {}", address, s),
@@ -119,7 +118,7 @@ impl ValidatorSet for ValidatorContract {
 	}
 
 	fn report_benign(&self, address: &Address, _set_block: BlockNumber, block: BlockNumber) {
-		let data = self.provider.functions().report_benign().input(*address, block);
+		let data = validator_report::functions::report_benign::encode_input(*address, block);
 		match self.transact(data) {
 			Ok(_) => warn!(target: "engine", "Reported benign validator misbehaviour {}", address),
 			Err(s) => warn!(target: "engine", "Validator {} could not be reported {}", address, s),
@@ -141,18 +140,19 @@ mod tests {
 	use bytes::ToPretty;
 	use rlp::encode;
 	use spec::Spec;
-	use header::Header;
-	use account_provider::AccountProvider;
-	use miner::MinerService;
+	use types::header::Header;
+	use accounts::AccountProvider;
+	use miner::{self, MinerService};
 	use types::ids::BlockId;
-	use test_helpers::generate_dummy_client_with_spec_and_accounts;
-	use client::{BlockChainClient, ChainInfo, BlockInfo, CallContract};
+	use test_helpers::generate_dummy_client_with_spec;
+	use call_contract::CallContract;
+	use client::{BlockChainClient, ChainInfo, BlockInfo};
 	use super::super::ValidatorSet;
 	use super::ValidatorContract;
 
 	#[test]
 	fn fetches_validators() {
-		let client = generate_dummy_client_with_spec_and_accounts(Spec::new_validator_contract, None);
+		let client = generate_dummy_client_with_spec(Spec::new_validator_contract);
 		let vc = Arc::new(ValidatorContract::new("0000000000000000000000000000000000000005".parse::<Address>().unwrap()));
 		vc.register_client(Arc::downgrade(&client) as _);
 		let last_hash = client.best_block_header().hash();
@@ -164,13 +164,14 @@ mod tests {
 	fn reports_validators() {
 		let tap = Arc::new(AccountProvider::transient_provider());
 		let v1 = tap.insert_account(keccak("1").into(), &"".into()).unwrap();
-		let client = generate_dummy_client_with_spec_and_accounts(Spec::new_validator_contract, Some(tap.clone()));
+		let client = generate_dummy_client_with_spec(Spec::new_validator_contract);
 		client.engine().register_client(Arc::downgrade(&client) as _);
 		let validator_contract = "0000000000000000000000000000000000000005".parse::<Address>().unwrap();
 
 		// Make sure reporting can be done.
 		client.miner().set_gas_range_target((1_000_000.into(), 1_000_000.into()));
-		client.miner().set_author(v1, Some("".into())).unwrap();
+		let signer = Box::new((tap.clone(), v1, "".into()));
+		client.miner().set_author(miner::Author::Sealer(signer));
 
 		// Check a block that is a bit in future, reject it but don't report the validator.
 		let mut header = Header::default();

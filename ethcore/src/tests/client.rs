@@ -1,42 +1,43 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::str::FromStr;
 use std::sync::Arc;
+
+use ethereum_types::{U256, Address};
+use ethkey::KeyPair;
 use hash::keccak;
 use io::IoChannel;
-use client::{BlockChainClient, Client, ClientConfig, BlockId, ChainInfo, BlockInfo, PrepareOpenBlock, ImportSealedBlock, ImportBlock};
-use state::{self, State, CleanupMode};
-use executive::{Executive, TransactOptions};
+use tempdir::TempDir;
+use types::transaction::{PendingTransaction, Transaction, Action, Condition};
+use types::filter::Filter;
+use types::view;
+use types::views::BlockView;
+
+use client::{BlockChainClient, BlockChainReset, Client, ClientConfig, BlockId, ChainInfo, BlockInfo, PrepareOpenBlock, ImportSealedBlock, ImportBlock};
 use ethereum;
-use block::IsBlock;
+use executive::{Executive, TransactOptions};
+use miner::{Miner, PendingOrdering, MinerService};
+use spec::Spec;
+use state::{self, State, CleanupMode};
 use test_helpers::{
+	self,
 	generate_dummy_client, push_blocks_to_client, get_test_client_with_blocks, get_good_dummy_block_seq,
 	generate_dummy_client_with_data, get_good_dummy_block, get_bad_state_dummy_block
 };
-use types::filter::Filter;
-use ethereum_types::{U256, Address};
-use miner::{Miner, PendingOrdering};
-use spec::Spec;
-use views::BlockView;
-use ethkey::KeyPair;
-use transaction::{PendingTransaction, Transaction, Action, Condition};
-use miner::MinerService;
-use tempdir::TempDir;
-use test_helpers;
 use verification::queue::kind::blocks::Unverified;
 
 #[test]
@@ -252,7 +253,7 @@ fn can_mine() {
 
 	let b = client.prepare_open_block(Address::default(), (3141562.into(), 31415620.into()), vec![]).unwrap().close().unwrap();
 
-	assert_eq!(*b.block().header().parent_hash(), view!(BlockView, &dummy_blocks[0]).header_view().hash());
+	assert_eq!(*b.header.parent_hash(), view!(BlockView, &dummy_blocks[0]).header_view().hash());
 }
 
 #[test]
@@ -364,4 +365,24 @@ fn transaction_proof() {
 
 	assert_eq!(state.balance(&Address::default()).unwrap(), 5.into());
 	assert_eq!(state.balance(&address).unwrap(), 95.into());
+}
+
+#[test]
+fn reset_blockchain() {
+	let client = get_test_client_with_blocks(get_good_dummy_block_seq(19));
+	// 19 + genesis block
+	assert!(client.block_header(BlockId::Number(20)).is_some());
+	assert_eq!(client.block_header(BlockId::Number(20)).unwrap().hash(), client.best_block_header().hash());
+
+	assert!(client.reset(5).is_ok());
+
+	client.chain().clear_cache();
+
+	assert!(client.block_header(BlockId::Number(20)).is_none());
+	assert!(client.block_header(BlockId::Number(19)).is_none());
+	assert!(client.block_header(BlockId::Number(18)).is_none());
+	assert!(client.block_header(BlockId::Number(17)).is_none());
+	assert!(client.block_header(BlockId::Number(16)).is_none());
+
+	assert!(client.block_header(BlockId::Number(15)).is_some());
 }

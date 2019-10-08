@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Ethereum Transaction Queue
 
@@ -23,11 +23,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ethereum_types::{H256, U256, Address};
 use parking_lot::RwLock;
-use transaction;
 use txpool::{self, Verifier};
+use types::transaction;
 
 use pool::{
-	self, scoring, verifier, client, ready, listener,
+	self, replace, scoring, verifier, client, ready, listener,
 	PrioritizationStrategy, PendingOrdering, PendingSettings,
 };
 use pool::local_transactions::LocalTransactionsList;
@@ -240,7 +240,7 @@ impl TransactionQueue {
 	///
 	/// Given blockchain and state access (Client)
 	/// verifies and imports transactions to the pool.
-	pub fn import<C: client::Client>(
+	pub fn import<C: client::Client + client::NonceClient + Clone>(
 		&self,
 		client: C,
 		transactions: Vec<verifier::Transaction>,
@@ -263,11 +263,13 @@ impl TransactionQueue {
 		};
 
 		let verifier = verifier::Verifier::new(
-			client,
+			client.clone(),
 			options,
 			self.insertion_id.clone(),
 			transaction_to_replace,
 		);
+
+		let mut replace = replace::ReplaceByScoreAndReadiness::new(self.pool.read().scoring().clone(), client);
 
 		let results = transactions
 			.into_iter()
@@ -286,7 +288,7 @@ impl TransactionQueue {
 				let imported = verifier
 					.verify_transaction(transaction)
 					.and_then(|verified| {
-						self.pool.write().import(verified).map_err(convert_error)
+						self.pool.write().import(verified, &mut replace).map_err(convert_error)
 					});
 
 				match imported {
@@ -313,6 +315,12 @@ impl TransactionQueue {
 	pub fn all_transactions(&self) -> Vec<Arc<pool::VerifiedTransaction>> {
 		let ready = |_tx: &pool::VerifiedTransaction| txpool::Readiness::Ready;
 		self.pool.read().unordered_pending(ready).collect()
+	}
+
+	/// Returns all transaction hashes in the queue without explicit ordering.
+	pub fn all_transaction_hashes(&self) -> Vec<H256> {
+		let ready = |_tx: &pool::VerifiedTransaction| txpool::Readiness::Ready;
+		self.pool.read().unordered_pending(ready).map(|tx| tx.hash).collect()
 	}
 
 	/// Computes unordered set of pending hashes.
@@ -468,7 +476,7 @@ impl TransactionQueue {
 
 		self.pool.read().pending_from_sender(state_readiness, address)
 			.last()
-			.map(|tx| tx.signed().nonce + 1)
+			.map(|tx| tx.signed().nonce.saturating_add(U256::from(1)))
 	}
 
 	/// Retrieve a transaction from the pool.
@@ -573,17 +581,13 @@ impl TransactionQueue {
 	}
 }
 
-fn convert_error(err: txpool::Error) -> transaction::Error {
-	use self::txpool::ErrorKind;
+fn convert_error<H: fmt::Debug + fmt::LowerHex>(err: txpool::Error<H>) -> transaction::Error {
+	use self::txpool::Error;
 
-	match *err.kind() {
-		ErrorKind::AlreadyImported(..) => transaction::Error::AlreadyImported,
-		ErrorKind::TooCheapToEnter(..) => transaction::Error::LimitReached,
-		ErrorKind::TooCheapToReplace(..) => transaction::Error::TooCheapToReplace,
-		ref e => {
-			warn!(target: "txqueue", "Unknown import error: {:?}", e);
-			transaction::Error::NotAllowed
-		},
+	match err {
+		Error::AlreadyImported(..) => transaction::Error::AlreadyImported,
+		Error::TooCheapToEnter(..) => transaction::Error::LimitReached,
+		Error::TooCheapToReplace(..) => transaction::Error::TooCheapToReplace { prev: None, new: None }
 	}
 }
 

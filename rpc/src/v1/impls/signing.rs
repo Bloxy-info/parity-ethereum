@@ -1,41 +1,43 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Signing RPC implementation.
 
 use std::sync::Arc;
 use transient_hashmap::TransientHashMap;
-use ethereum_types::U256;
 use parking_lot::Mutex;
 
-use ethcore::account_provider::AccountProvider;
+use ethereum_types::{H160, H256, H520, U256};
 
 use jsonrpc_core::{BoxFuture, Result, Error};
 use jsonrpc_core::futures::{future, Future, Poll, Async};
 use jsonrpc_core::futures::future::Either;
-use v1::helpers::{
-	errors, DefaultAccount, SignerService, SigningQueue,
+
+use v1::helpers::deprecated::{self, DeprecationNotice};
+use v1::helpers::dispatch::{self, Dispatcher};
+use v1::helpers::errors;
+use v1::helpers::external_signer::{
+	SignerService, SigningQueue,
 	ConfirmationReceiver as RpcConfirmationReceiver,
 	ConfirmationResult as RpcConfirmationResult,
 };
-use v1::helpers::dispatch::{self, Dispatcher};
 use v1::metadata::Metadata;
 use v1::traits::{EthSigning, ParitySigning};
 use v1::types::{
-	H160 as RpcH160, H256 as RpcH256, U256 as RpcU256, Bytes as RpcBytes, H520 as RpcH520,
+	Bytes as RpcBytes,
 	Either as RpcEither,
 	RichRawTransaction as RpcRichRawTransaction,
 	TransactionRequest as RpcTransactionRequest,
@@ -44,7 +46,7 @@ use v1::types::{
 	Origin,
 };
 
-use parity_reactor::Remote;
+use parity_runtime::Executor;
 
 /// After 60s entries that are not queried with `check_request` will get garbage collected.
 const MAX_PENDING_DURATION_SEC: u32 = 60;
@@ -67,13 +69,13 @@ impl Future for DispatchResult {
 	}
 }
 
-fn schedule(remote: Remote,
+fn schedule(executor: Executor,
 	confirmations: Arc<Mutex<TransientHashMap<U256, Option<RpcConfirmationResult>>>>,
 	id: U256,
 	future: RpcConfirmationReceiver) {
 	{
 		let mut confirmations = confirmations.lock();
-		confirmations.insert(id.clone(), None);
+		confirmations.insert(id, None);
 	}
 
 	let future = future.then(move |result| {
@@ -83,45 +85,44 @@ fn schedule(remote: Remote,
 		confirmations.insert(id, Some(result));
 		Ok(())
 	});
-	remote.spawn(future);
+	executor.spawn(future);
 }
 
 /// Implementation of functions that require signing when no trusted signer is used.
 pub struct SigningQueueClient<D> {
 	signer: Arc<SignerService>,
-	accounts: Arc<AccountProvider>,
+	accounts: Arc<dispatch::Accounts>,
 	dispatcher: D,
-	remote: Remote,
+	executor: Executor,
 	// None here means that the request hasn't yet been confirmed
 	confirmations: Arc<Mutex<TransientHashMap<U256, Option<RpcConfirmationResult>>>>,
+	deprecation_notice: DeprecationNotice,
 }
 
 impl<D: Dispatcher + 'static> SigningQueueClient<D> {
 	/// Creates a new signing queue client given shared signing queue.
-	pub fn new(signer: &Arc<SignerService>, dispatcher: D, remote: Remote, accounts: &Arc<AccountProvider>) -> Self {
+	pub fn new(signer: &Arc<SignerService>, dispatcher: D, executor: Executor, accounts: &Arc<dispatch::Accounts>) -> Self {
 		SigningQueueClient {
 			signer: signer.clone(),
 			accounts: accounts.clone(),
 			dispatcher,
-			remote,
+			executor,
 			confirmations: Arc::new(Mutex::new(TransientHashMap::new(MAX_PENDING_DURATION_SEC))),
+			deprecation_notice: Default::default(),
 		}
 	}
 
-	fn dispatch(&self, payload: RpcConfirmationPayload, default_account: DefaultAccount, origin: Origin) -> BoxFuture<DispatchResult> {
+	fn dispatch(&self, payload: RpcConfirmationPayload, origin: Origin) -> BoxFuture<DispatchResult> {
+		let default_account = self.accounts.default_account();
 		let accounts = self.accounts.clone();
-		let default_account = match default_account {
-			DefaultAccount::Provided(acc) => acc,
-		};
-
 		let dispatcher = self.dispatcher.clone();
 		let signer = self.signer.clone();
 		Box::new(dispatch::from_rpc(payload, default_account, &dispatcher)
 			.and_then(move |payload| {
 				let sender = payload.sender();
 				if accounts.is_unlocked(&sender) {
-					Either::A(dispatch::execute(dispatcher, accounts, payload, dispatch::SignWith::Nothing)
-						.map(|v| v.into_value())
+					Either::A(dispatch::execute(dispatcher, &accounts, payload, dispatch::SignWith::Nothing)
+						.map(dispatch::WithToken::into_value)
 						.map(DispatchResult::Value))
 				} else {
 					Either::B(future::done(
@@ -138,43 +139,44 @@ impl<D: Dispatcher + 'static> ParitySigning for SigningQueueClient<D> {
 	type Metadata = Metadata;
 
 	fn compose_transaction(&self, _meta: Metadata, transaction: RpcTransactionRequest) -> BoxFuture<RpcTransactionRequest> {
-		let default_account = self.accounts.default_account().ok().unwrap_or_default();
+		let default_account = self.accounts.default_account();
 		Box::new(self.dispatcher.fill_optional_fields(transaction.into(), default_account, true).map(Into::into))
 	}
 
-	fn post_sign(&self, meta: Metadata, address: RpcH160, data: RpcBytes) -> BoxFuture<RpcEither<RpcU256, RpcConfirmationResponse>> {
-		let remote = self.remote.clone();
+	fn post_sign(&self, meta: Metadata, address: H160, data: RpcBytes) -> BoxFuture<RpcEither<U256, RpcConfirmationResponse>> {
+		self.deprecation_notice.print("parity_postSign", deprecated::msgs::ACCOUNTS);
+		let executor = self.executor.clone();
 		let confirmations = self.confirmations.clone();
 
 		Box::new(self.dispatch(
-			RpcConfirmationPayload::EthSignMessage((address.clone(), data).into()),
-			DefaultAccount::Provided(address.into()),
+			RpcConfirmationPayload::EthSignMessage((address, data).into()),
 			meta.origin
 		).map(move |result| match result {
 			DispatchResult::Value(v) => RpcEither::Or(v),
 			DispatchResult::Future(id, future) => {
-				schedule(remote, confirmations, id, future);
-				RpcEither::Either(id.into())
+				schedule(executor, confirmations, id, future);
+				RpcEither::Either(id)
 			},
 		}))
 	}
 
-	fn post_transaction(&self, meta: Metadata, request: RpcTransactionRequest) -> BoxFuture<RpcEither<RpcU256, RpcConfirmationResponse>> {
-		let remote = self.remote.clone();
+	fn post_transaction(&self, meta: Metadata, request: RpcTransactionRequest) -> BoxFuture<RpcEither<U256, RpcConfirmationResponse>> {
+		self.deprecation_notice.print("parity_postTransaction", deprecated::msgs::ACCOUNTS);
+		let executor = self.executor.clone();
 		let confirmations = self.confirmations.clone();
 
-		Box::new(self.dispatch(RpcConfirmationPayload::SendTransaction(request), DefaultAccount::Provided(self.accounts.default_account().ok().unwrap_or_default()), meta.origin)
+		Box::new(self.dispatch(RpcConfirmationPayload::SendTransaction(request), meta.origin)
 			.map(|result| match result {
 				DispatchResult::Value(v) => RpcEither::Or(v),
 				DispatchResult::Future(id, future) => {
-					schedule(remote, confirmations, id, future);
-					RpcEither::Either(id.into())
+					schedule(executor, confirmations, id, future);
+					RpcEither::Either(id)
 				},
 			}))
 	}
 
-	fn check_request(&self, id: RpcU256) -> Result<Option<RpcConfirmationResponse>> {
-		let id: U256 = id.into();
+	fn check_request(&self, id: U256) -> Result<Option<RpcConfirmationResponse>> {
+		self.deprecation_notice.print("parity_checkRequest", deprecated::msgs::ACCOUNTS);
 		match self.confirmations.lock().get(&id) {
 			None => Err(errors::request_not_found()), // Request info has been dropped, or even never been there
 			Some(&None) => Ok(None), // No confirmation yet, request is known, confirmation is pending
@@ -182,10 +184,10 @@ impl<D: Dispatcher + 'static> ParitySigning for SigningQueueClient<D> {
 		}
 	}
 
-	fn decrypt_message(&self, meta: Metadata, address: RpcH160, data: RpcBytes) -> BoxFuture<RpcBytes> {
+	fn decrypt_message(&self, meta: Metadata, address: H160, data: RpcBytes) -> BoxFuture<RpcBytes> {
+		self.deprecation_notice.print("parity_decryptMessage", deprecated::msgs::ACCOUNTS);
 		let res = self.dispatch(
-			RpcConfirmationPayload::Decrypt((address.clone(), data).into()),
-			address.into(),
+			RpcConfirmationPayload::Decrypt((address, data).into()),
 			meta.origin,
 		);
 
@@ -202,10 +204,10 @@ impl<D: Dispatcher + 'static> ParitySigning for SigningQueueClient<D> {
 impl<D: Dispatcher + 'static> EthSigning for SigningQueueClient<D> {
 	type Metadata = Metadata;
 
-	fn sign(&self, meta: Metadata, address: RpcH160, data: RpcBytes) -> BoxFuture<RpcH520> {
+	fn sign(&self, meta: Metadata, address: H160, data: RpcBytes) -> BoxFuture<H520> {
+		self.deprecation_notice.print("eth_sign", deprecated::msgs::ACCOUNTS);
 		let res = self.dispatch(
-			RpcConfirmationPayload::EthSignMessage((address.clone(), data).into()),
-			address.into(),
+			RpcConfirmationPayload::EthSignMessage((address, data).into()),
 			meta.origin,
 		);
 
@@ -217,10 +219,10 @@ impl<D: Dispatcher + 'static> EthSigning for SigningQueueClient<D> {
 		}))
 	}
 
-	fn send_transaction(&self, meta: Metadata, request: RpcTransactionRequest) -> BoxFuture<RpcH256> {
+	fn send_transaction(&self, meta: Metadata, request: RpcTransactionRequest) -> BoxFuture<H256> {
+		self.deprecation_notice.print("eth_sendTransaction", deprecated::msgs::ACCOUNTS);
 		let res = self.dispatch(
 			RpcConfirmationPayload::SendTransaction(request),
-			DefaultAccount::Provided(self.accounts.default_account().ok().unwrap_or_default()),
 			meta.origin,
 		);
 
@@ -233,9 +235,10 @@ impl<D: Dispatcher + 'static> EthSigning for SigningQueueClient<D> {
 	}
 
 	fn sign_transaction(&self, meta: Metadata, request: RpcTransactionRequest) -> BoxFuture<RpcRichRawTransaction> {
+		self.deprecation_notice.print("eth_signTransaction", deprecated::msgs::ACCOUNTS);
+
 		let res = self.dispatch(
 			RpcConfirmationPayload::SignTransaction(request),
-			DefaultAccount::Provided(self.accounts.default_account().ok().unwrap_or_default()),
 			meta.origin,
 		);
 

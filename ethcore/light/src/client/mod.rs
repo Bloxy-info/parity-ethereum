@@ -1,38 +1,39 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Light client implementation. Stores data from light sync
 
 use std::sync::{Weak, Arc};
 
-use ethcore::block_status::BlockStatus;
 use ethcore::client::{ClientReport, EnvInfo, ClientIoMessage};
 use ethcore::engines::{epoch, EthEngine, EpochChange, EpochTransition, Proof};
 use ethcore::machine::EthereumMachine;
-use ethcore::error::{Error, BlockImportError};
-use ethcore::ids::BlockId;
-use ethcore::header::{BlockNumber, Header};
+use ethcore::error::{Error, EthcoreResult};
 use ethcore::verification::queue::{self, HeaderQueue};
-use ethcore::blockchain_info::BlockChainInfo;
 use ethcore::spec::{Spec, SpecHardcodedSync};
-use ethcore::encoded;
 use io::IoChannel;
 use parking_lot::{Mutex, RwLock};
 use ethereum_types::{H256, U256};
 use futures::{IntoFuture, Future};
+use common_types::BlockNumber;
+use common_types::block_status::BlockStatus;
+use common_types::blockchain_info::BlockChainInfo;
+use common_types::encoded;
+use common_types::header::Header;
+use common_types::ids::BlockId;
 
 use kvdb::KeyValueDB;
 
@@ -85,7 +86,7 @@ pub trait LightChainClient: Send + Sync {
 
 	/// Queue header to be verified. Required that all headers queued have their
 	/// parent queued prior.
-	fn queue_header(&self, header: Header) -> Result<H256, BlockImportError>;
+	fn queue_header(&self, header: Header) -> EthcoreResult<H256>;
 
 	/// Attempt to get a block hash by block id.
 	fn block_hash(&self, id: BlockId) -> Option<H256>;
@@ -114,6 +115,9 @@ pub trait LightChainClient: Send + Sync {
 
 	/// Query whether a block is known.
 	fn is_known(&self, hash: &H256) -> bool;
+
+	/// Set the chain via a spec name.
+	fn set_spec_name(&self, new_spec_name: String) -> Result<(), ()>;
 
 	/// Clear the queue.
 	fn clear_queue(&self);
@@ -163,6 +167,8 @@ pub struct Client<T> {
 	listeners: RwLock<Vec<Weak<LightChainNotify>>>,
 	fetcher: T,
 	verify_full: bool,
+	/// A closure to call when we want to restart the client
+	exit_handler: Mutex<Option<Box<Fn(String) + 'static + Send>>>,
 }
 
 impl<T: ChainDataFetcher> Client<T> {
@@ -189,6 +195,7 @@ impl<T: ChainDataFetcher> Client<T> {
 			listeners: RwLock::new(vec![]),
 			fetcher,
 			verify_full: config.verify_full,
+			exit_handler: Mutex::new(None),
 		})
 	}
 
@@ -206,8 +213,8 @@ impl<T: ChainDataFetcher> Client<T> {
 	}
 
 	/// Import a header to the queue for additional verification.
-	pub fn import_header(&self, header: Header) -> Result<H256, BlockImportError> {
-		self.queue.import(header).map_err(Into::into)
+	pub fn import_header(&self, header: Header) -> EthcoreResult<H256> {
+		self.queue.import(header).map_err(|(_, e)| e)
 	}
 
 	/// Inquire about the status of a given header.
@@ -313,7 +320,7 @@ impl<T: ChainDataFetcher> Client<T> {
 					The node may not be able to synchronize further.", e);
 			}
 
-			let epoch_proof = self.engine.is_epoch_end(
+			let epoch_proof = self.engine.is_epoch_end_light(
 				&verified_header,
 				&|h| self.chain.block_header(BlockId::Hash(h)).and_then(|hdr| hdr.decode().ok()),
 				&|h| self.chain.pending_transition(h),
@@ -357,6 +364,14 @@ impl<T: ChainDataFetcher> Client<T> {
 		use heapsize::HeapSizeOf;
 
 		self.chain.heap_size_of_children()
+	}
+
+	/// Set a closure to call when the client wants to be restarted.
+	///
+	/// The parameter passed to the callback is the name of the new chain spec to use after
+	/// the restart.
+	pub fn set_exit_handler<F>(&self, f: F) where F: Fn(String) + 'static + Send {
+		*self.exit_handler.lock() = Some(Box::new(f));
 	}
 
 	/// Get a handle to the verification engine.
@@ -526,7 +541,7 @@ impl<T: ChainDataFetcher> LightChainClient for Client<T> {
 
 	fn chain_info(&self) -> BlockChainInfo { Client::chain_info(self) }
 
-	fn queue_header(&self, header: Header) -> Result<H256, BlockImportError> {
+	fn queue_header(&self, header: Header) -> EthcoreResult<H256> {
 		self.import_header(header)
 	}
 
@@ -560,6 +575,17 @@ impl<T: ChainDataFetcher> LightChainClient for Client<T> {
 
 	fn engine(&self) -> &Arc<EthEngine> {
 		Client::engine(self)
+	}
+
+	fn set_spec_name(&self, new_spec_name: String) -> Result<(), ()> {
+		trace!(target: "mode", "Client::set_spec_name({:?})", new_spec_name);
+		if let Some(ref h) = *self.exit_handler.lock() {
+			(*h)(new_spec_name);
+			Ok(())
+		} else {
+			warn!("Not hypervised; cannot change chain.");
+			Err(())
+		}
 	}
 
 	fn is_known(&self, hash: &H256) -> bool {

@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 #![feature(test)]
 
@@ -31,8 +31,8 @@ use ethbloom::Bloom;
 fn blooms_filter_1_million_ok(b: &mut Bencher) {
 	let tempdir = TempDir::new("").unwrap();
 	let database = Database::open(tempdir.path()).unwrap();
-	database.insert_blooms(999_999, iter::once(&Bloom::from(0))).unwrap();
-	let bloom = Bloom::from(0x001);
+	database.insert_blooms(999_999, iter::once(&Bloom::zero())).unwrap();
+	let bloom = Bloom::from_low_u64_be(0x001);
 	database.insert_blooms(200_000, iter::once(&bloom)).unwrap();
 	database.insert_blooms(400_000, iter::once(&bloom)).unwrap();
 	database.insert_blooms(600_000, iter::once(&bloom)).unwrap();
@@ -48,9 +48,9 @@ fn blooms_filter_1_million_ok(b: &mut Bencher) {
 fn blooms_filter_1_million_miss(b: &mut Bencher) {
 	let tempdir = TempDir::new("").unwrap();
 	let database = Database::open(tempdir.path()).unwrap();
-	database.insert_blooms(999_999, iter::once(&Bloom::from(0))).unwrap();
-	let bloom = Bloom::from(0x001);
-	let bad_bloom = Bloom::from(0x0001);
+	database.insert_blooms(999_999, iter::once(&Bloom::zero())).unwrap();
+	let bloom = Bloom::from_low_u64_be(0x001);
+	let bad_bloom = Bloom::from_low_u64_be(0x0001);
 	database.insert_blooms(200_000, iter::once(&bloom)).unwrap();
 	database.insert_blooms(400_000, iter::once(&bloom)).unwrap();
 	database.insert_blooms(600_000, iter::once(&bloom)).unwrap();
@@ -66,9 +66,9 @@ fn blooms_filter_1_million_miss(b: &mut Bencher) {
 fn blooms_filter_1_million_miss_and_ok(b: &mut Bencher) {
 	let tempdir = TempDir::new("").unwrap();
 	let database = Database::open(tempdir.path()).unwrap();
-	database.insert_blooms(999_999, iter::once(&Bloom::from(0))).unwrap();
-	let bloom = Bloom::from(0x001);
-	let bad_bloom = Bloom::from(0x0001);
+	database.insert_blooms(999_999, iter::once(&Bloom::zero())).unwrap();
+	let bloom = Bloom::from_low_u64_be(0x001);
+	let bad_bloom = Bloom::from_low_u64_be(0x0001);
 	database.insert_blooms(200_000, iter::once(&bloom)).unwrap();
 	database.insert_blooms(400_000, iter::once(&bloom)).unwrap();
 	database.insert_blooms(600_000, iter::once(&bloom)).unwrap();
