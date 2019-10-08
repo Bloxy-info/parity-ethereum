@@ -36,6 +36,7 @@ use miner::external::ExternalMiner;
 use parity_rpc::dispatch::{FullDispatcher, LightDispatcher};
 use parity_rpc::informant::{ActivityNotifier, ClientNotifier};
 use parity_rpc::{Host, Metadata, NetworkSettings};
+use parity_rpc::v1::traits::Bulk;
 use parity_runtime::Executor;
 use parking_lot::{Mutex, RwLock};
 use sync::{LightSync, ManageNetwork, SyncProvider};
@@ -424,9 +425,7 @@ impl FullDependencies {
 					);
 				}
 				Api::Traces => handler.extend_with(TracesClient::new(&self.client).to_delegate()),
-				Api::Bulk => {
-					handler.extend_with(BulkClient::new(&self.client, &self.miner).to_delegate())
-				},
+				Api::Bulk => handler.extend_with(BulkClient::new(&self.client, &self.miner).to_delegate()),
 				Api::Rpc => {
 					let modules = to_modules(&apis);
 					handler.extend_with(RpcClient::new(modules).to_delegate());
@@ -653,7 +652,7 @@ impl<C: LightChainClient + 'static> LightDependencies<C> {
 						self.client.clone(),
 						self.on_demand.clone(),
 						self.transaction_queue.clone(),
-						self.secret_store.clone(),
+						accounts.clone(),
 						self.cache.clone(),
 						self.gas_price_percentile,
 						self.poll_lifetime,
@@ -662,7 +661,7 @@ impl<C: LightChainClient + 'static> LightDependencies<C> {
 
 					if !for_generic_pubsub {
 						handler.extend_with(EthFilter::to_delegate(client));
-						add_signing_methods!(EthSigning, handler, self);
+						add_signing_methods!(EthSigning, handler, self, (&dispatcher, &account_signer));
 					}
 				},
 				Api::Rpc => {
