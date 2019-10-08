@@ -476,14 +476,6 @@ fn execute_impl<Cr, Rr>(cmd: RunCmd, logger: Arc<RotatingLogger>, on_client_rq: 
 
 	let passwords = passwords_from_files(&cmd.acc_conf.password_files)?;
 
-	// Run in daemon mode.
-	// Note, that it should be called before we leave any file descriptor open,
-	// since `daemonize` will close them.
-	if let Some(pid_file) = cmd.daemon {
-		info!("Running as a daemon process!");
-		daemonize(pid_file)?;
-	}
-
 	// prepare account provider
 	let account_provider = Arc::new(account_utils::prepare_account_provider(&cmd.spec, &cmd.dirs, &spec.data_dir, cmd.acc_conf, &passwords)?);
 

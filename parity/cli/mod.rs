@@ -921,10 +921,6 @@ usage! {
 			"--snapshot-threads=[NUM]",
 			"Enables multiple threads for snapshots creation.",
 
-			ARG arg_snapshot_threads: (Option<usize>) = None, or |c: &Config| c.snapshots.as_ref()?.processing_threads,
-			"--snapshot-threads=[NUM]",
-			"Enables multiple threads for snapshots creation.",
-
 		["Whisper Options"]
 			FLAG flag_whisper: (bool) = false, or |c: &Config| c.whisper.as_ref()?.enabled,
 			"--whisper",
