@@ -1,5 +1,5 @@
 //! Eth rpc interface.
-use jsonrpc_core::{BoxFuture};
+use jsonrpc_core::{Result, BoxFuture};
 use jsonrpc_derive::rpc;
 
 
