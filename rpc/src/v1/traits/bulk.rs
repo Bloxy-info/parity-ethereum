@@ -13,7 +13,7 @@ pub trait Bulk {
 
 	/// Returns block with given number.
 	#[rpc(name = "bulk_getBlockByNumber")]
-	fn block_by_number(&self, BlockNumber) -> BoxFuture<Option<BlockWithTransactions>>;
+	fn block_by_number(&self, _: BlockNumber) -> BoxFuture<Option<BlockWithTransactions>>;
 
 }
 
