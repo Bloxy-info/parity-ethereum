@@ -7,7 +7,7 @@ use v1::types::{BlockNumber,  BlockWithTransactions};
 
 
 /// Eth rpc interface.
-#[rpc]
+#[rpc(server)]
 pub trait Bulk {
 	type Metadata;
 
