@@ -164,9 +164,9 @@ impl<C, M, T: StateInfo + 'static> BulkClient<C, M> where
 								let traces = if include_traces {
 												self.client.transaction_traces(TransactionId::Hash(hash)).map(|traces|
                                 												traces.into_iter().map(LocalizedTrace::from).collect()
-                                				).unwrap();
+                                				).unwrap()
 											 } else {
-											 	Vec::new();
+											 	Vec::new()
 											 };
 
 								TransactionWithReceipt {
