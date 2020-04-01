@@ -79,7 +79,7 @@ impl<C, M, T: StateInfo + 'static> BulkClient<C, M> where
 		}
 	}
 
-	fn block(&self, id: BlockNumberOrId, include_traces: bool) -> Result<Option<BlockWithTransactions>> {
+	fn block(&self, id: BlockNumberOrId, without_traces: bool) -> Result<Option<BlockWithTransactions>> {
 		let client = &self.client;
 
 		let client_query = |id| (client.block(id), client.block_total_difficulty(id), client.block_extra_info(id), false);
@@ -161,12 +161,12 @@ impl<C, M, T: StateInfo + 'static> BulkClient<C, M> where
 						transactions: block.view().localized_transactions().into_iter().map(|t|
 							{
 								let hash = t.hash().into();
-								let traces = if include_traces {
-												self.client.transaction_traces(TransactionId::Hash(hash)).map(|traces|
-                                												traces.into_iter().map(LocalizedTrace::from).collect()
-                                				).unwrap()
+								let traces = if without_traces {
+												Vec::new()
 											 } else {
-											 	Vec::new()
+												self.client.transaction_traces(TransactionId::Hash(hash)).map(|traces|
+																				traces.into_iter().map(LocalizedTrace::from).collect()
+												).unwrap()
 											 };
 
 								TransactionWithReceipt {
@@ -193,7 +193,7 @@ impl<C, M, T: StateInfo + 'static> Bulk for BulkClient<C, M> where
 
 	type Metadata = Metadata;
 
-	fn block_by_number(&self, num: BlockNumber, include_traces: bool) -> BoxFuture<Option<BlockWithTransactions>> {
-		Box::new(future::done(self.block(num.into(), include_traces)))
+	fn block_by_number(&self, num: BlockNumber, without_traces: bool) -> BoxFuture<Option<BlockWithTransactions>> {
+		Box::new(future::done(self.block(num.into(), without_traces)))
 	}
 }
