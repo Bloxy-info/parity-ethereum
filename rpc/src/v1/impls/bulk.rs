@@ -166,7 +166,7 @@ impl<C, M, T: StateInfo + 'static> BulkClient<C, M> where
                                 												traces.into_iter().map(LocalizedTrace::from).collect()
                                 				).unwrap();
 											 } else {
-											 	Vec<LocalizedTrace>::new();
+											 	Vec::new();
 											 };
 
 								TransactionWithReceipt {
